@@ -5,7 +5,7 @@ Architecture
 One BackgroundScheduler runs a single job every 5 minutes:
   _main_loop() → asyncio.run(_async_main_loop())
 
-Inside _async_main_loop() six checks happen every tick:
+Inside _async_main_loop() seven checks happen every tick:
 
   1. Morning check-ins
      For every active parent whose checkin_time falls within the current
@@ -17,13 +17,19 @@ Inside _async_main_loop() six checks happen every tick:
      send a standalone reminder IF the corresponding check_in for today
      hasn't already been sent.
 
-  3. Nudge (3 h after unanswered morning check-in)
+  3. Medicine retries
+     Re-sends medicine reminder when parent said "will take soon".
+     conversation.py writes medicine_retry_at into conversation_state.context.
 
-  4. Missed check (6 h after unanswered check-in)
+  4. Nudge (3 h after unanswered morning check-in)
 
-  5. Evening reports (daily + weekly on Sundays)
+  5. Missed check (6 h after unanswered check-in)
+     Marks check_in as missed, then sends an AMBER SILENCE FLAG to children
+     (not an emergency — WhatsApp only, no call, with I'll call / She's fine buttons).
 
-  6. Letter / note deliveries
+  6. Evening reports (daily + weekly on Sundays)
+
+  7. Letter / note deliveries
      Any pending letters whose deliver_date is today get delivered.
 
 Timezone: Asia/Kolkata (IST, UTC+5:30)
@@ -164,8 +170,8 @@ async def _check_morning_greetings(hhmm: str, today: str) -> None:
             if existing:
                 continue
 
-            # Advance health flows before starting conversation
-            # This ensures morning_greeting reflects correct health state
+            # Advance health flows before starting conversation so morning_greeting
+            # reflects the correct health state (active / recovery / confirmation)
             try:
                 await advance_health_flows(parent["id"])
             except Exception as hf_err:
@@ -267,7 +273,7 @@ async def _check_medicine_reminders(hhmm: str, today: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 2b — MEDICINE RETRIES (picks up "will take soon" / "remind later")
+# CHECK 3 — MEDICINE RETRIES (picks up "will take soon" / "remind later")
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_medicine_retries(today: str) -> None:
@@ -301,7 +307,7 @@ async def _check_medicine_retries(today: str) -> None:
             continue
 
         parent_id = state["parent_id"]
-        group_id = ctx.get("medicine_retry_group_id")
+        group_id  = ctx.get("medicine_retry_group_id")
         retry_count = ctx.get("medicine_retry_count", 0)
 
         try:
@@ -321,11 +327,12 @@ async def _check_medicine_retries(today: str) -> None:
                 for c in med_checkins
             )
             if already_taken:
-                # Clear retry — medicine was taken
                 ctx.pop("medicine_retry_at", None)
                 ctx.pop("medicine_retry_count", None)
                 ctx.pop("medicine_retry_group_id", None)
-                db.table("conversation_state").update({"context": ctx}).eq("id", state["id"]).execute()
+                db.table("conversation_state").update({"context": ctx}).eq(
+                    "id", state["id"]
+                ).execute()
                 continue
 
             # Load parent and medicine group for re-send
@@ -355,9 +362,11 @@ async def _check_medicine_retries(today: str) -> None:
                     )
                     await send_medicine_reminder(parent, grp_rows[0])
 
-            # Clear the retry (max 2 retries enforced by conversation.py)
+            # Clear the retry flag (max 2 retries enforced by conversation.py)
             ctx.pop("medicine_retry_at", None)
-            db.table("conversation_state").update({"context": ctx}).eq("id", state["id"]).execute()
+            db.table("conversation_state").update({"context": ctx}).eq(
+                "id", state["id"]
+            ).execute()
 
         except Exception as e:
             logger.error(
@@ -367,7 +376,7 @@ async def _check_medicine_retries(today: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 3 — NUDGE (3 h after unanswered morning check-in)
+# CHECK 4 — NUDGE (3 h after unanswered morning check-in)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_nudges(today: str) -> None:
@@ -432,12 +441,20 @@ async def _check_nudges(today: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 4 — MISSED CHECK-INS (6 h after unanswered)
+# CHECK 5 — MISSED CHECK-INS (6 h after unanswered)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_missed_checkins(today: str) -> None:
-    """Mark check-ins as 'missed' and alert family 6 hours after no reply."""
-    from app.services.whatsapp import send_message
+    """Mark morning check-ins as 'missed' after 6 h — then send a silence flag.
+
+    Silence flag is a distinct AMBER-TONE alert (NOT an emergency):
+    child gets a WhatsApp message with two reply options:
+      Reply 1 → I'll call them now
+      Reply 2 → She's fine, I know
+
+    No auto-call, no escalation. Just a heads-up.
+    """
+    from app.services.emergency import send_silence_flag
 
     db = get_db()
     cutoff = (datetime.utcnow() - timedelta(hours=6)).isoformat()
@@ -459,13 +476,16 @@ async def _check_missed_checkins(today: str) -> None:
     for ci in stale:
         parent_id = ci["parent_id"]
         try:
+            # Mark the check_in row as missed
             db.table("check_ins").update({"status": "missed"}).eq(
                 "id", ci["id"]
             ).execute()
 
+            # Only send the silence flag once — on the morning_greeting touchpoint
             if ci["touchpoint"] != "morning_greeting":
                 continue
 
+            # Load parent to get family_id and nickname
             parent_rows = (
                 db.table("parents")
                 .select("nickname, family_id")
@@ -476,39 +496,13 @@ async def _check_missed_checkins(today: str) -> None:
             if not parent_rows:
                 continue
 
-            parent    = parent_rows[0]
-            family_id = parent["family_id"]
-            nickname  = parent["nickname"]
+            family_id = parent_rows[0]["family_id"]
+            nickname  = parent_rows[0]["nickname"]
 
-            db.table("alerts").insert(
-                {
-                    "family_id": family_id,
-                    "parent_id": parent_id,
-                    "type":      "missed_checkin",
-                    "message":   f"{nickname} has not responded to today's check-in",
-                    "context":   {"date": today, "touchpoint": ci["touchpoint"]},
-                }
-            ).execute()
-
-            children = (
-                db.table("children")
-                .select("phone, name")
-                .eq("family_id", family_id)
-                .execute()
-                .data or []
-            )
-            for child in children:
-                await send_message(
-                    child["phone"],
-                    f"⚠️ *AYANA — Missed check-in*\n\n"
-                    f"*{nickname}* has not responded to today's check-in "
-                    f"(sent 6+ hours ago).\n\n"
-                    f"Please give them a call to make sure they're okay.",
-                )
             logger.warning(
-                f"[scheduler] Missed check-in alert sent for {nickname} "
-                f"(parent {parent_id})"
+                f"[scheduler] Sending silence flag for {nickname} (parent {parent_id})"
             )
+            await send_silence_flag(family_id, parent_id)
 
         except Exception as e:
             logger.error(
@@ -518,7 +512,7 @@ async def _check_missed_checkins(today: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 5 — EVENING REPORTS
+# CHECK 6 — EVENING REPORTS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None:
@@ -575,7 +569,7 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 6 — LETTER / NOTE DELIVERIES
+# CHECK 7 — LETTER / NOTE DELIVERIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_letter_deliveries(today: str) -> None:
