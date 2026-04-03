@@ -1,16 +1,20 @@
 """Child command handlers — all commands a caregiver child can send to AYANA.
 
 Commands:
-  menu / help        → show this command list
-  status             → latest check-in status for all parents
-  report [name] [Nd] → health summary (e.g. "report amma 7days")
-  ask [name] [text]  → queue a custom question for the next check-in
-  add parent         → start multi-step parent onboarding flow
-  add [phone]        → add a sibling / co-caregiver to the family
-  settings           → view current settings
+  menu / help           → show this command list
+  status                → latest check-in status for all parents
+  report [name] [Nd]    → health summary (e.g. "report amma 7days")
+  ask [name] [text]     → queue a custom question for the next check-in
+  pause [name] [Nd]     → pause check-ins while travelling
+  resume [name]         → resume paused check-ins
+  letter                → write a letter to deliver on a special day
+  note                  → send a note in today's check-in
+  add parent            → start multi-step parent onboarding flow
+  add [phone]           → add a sibling / co-caregiver to the family
+  settings              → view current settings
 
-Multi-step flows (add parent) use an in-memory state dict keyed by child phone.
-For a multi-worker / multi-instance deployment, swap _child_state for Redis.
+Multi-step flows (add parent, letter, note) use an in-memory state dict keyed
+by child phone. For multi-worker deployments, swap _child_state for Redis.
 """
 
 import logging
@@ -26,11 +30,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # ─── In-memory multi-step flow state ─────────────────────────────────────────
-# { child_phone: { "flow": str, "step": str, "data": dict } }
-# NOTE: reset on server restart — acceptable for low-traffic single-instance.
 _child_state: dict[str, dict] = {}
 
-# ─── Supported languages for parent onboarding ────────────────────────────────
+# ─── Supported languages ──────────────────────────────────────────────────────
 _LANGUAGES: dict[str, str] = {
     "Telugu": "te",
     "Hindi": "hi",
@@ -43,7 +45,7 @@ _LANGUAGES: dict[str, str] = {
     "Punjabi": "pa",
     "English": "en",
 }
-_LANGUAGE_LIST = list(_LANGUAGES.keys())  # ordered for numbered menu
+_LANGUAGE_LIST = list(_LANGUAGES.keys())
 
 _LANGUAGE_MENU = (
     "Which language does your parent speak?\n\n"
@@ -62,7 +64,7 @@ _DEFAULT_VOICE: dict[str, str] = {
     "mr": "sumedha",
     "gu": "nandita",
     "pa": "suresh",
-    "en": "maya",
+    "en": "anushka",
 }
 
 # ─── Anchor event → default time ─────────────────────────────────────────────
@@ -88,7 +90,6 @@ _ANCHOR_LABEL: dict[str, str] = {
     "night": "Night medicines",
 }
 
-# ─── Timing string → anchor event ────────────────────────────────────────────
 _TIMING_TO_ANCHOR: dict[str, str] = {
     "before_food": "before_food",
     "before_tea": "wake",
@@ -109,6 +110,13 @@ COMMAND_MENU = """\
 📋 *report*               — Get a health summary (1-day default)
 📋 *report amma 7days*    — 7-day report for a specific parent
 ❓ *ask amma [question]*  — Queue a question for the next check-in
+⏸️  *pause amma 3days*    — Pause check-ins while travelling
+▶️  *resume amma*         — Resume paused check-ins
+✈️  *travel amma 3days*   — Switch to travel-mode messages
+💌 *letter*               — Write a letter to deliver on a special day
+📝 *note*                 — Send a note in today's check-in
+🎂 *special*              — Add a birthday, anniversary, or festival
+📝 *bio*                  — Update a parent's daily routine
 ➕ *add parent*           — Register a new parent
 👥 *add +91XXXXXXXXXX*   — Add a sibling / co-caregiver
 ⚙️  *settings*             — View your current settings
@@ -119,30 +127,20 @@ _Example: ask Amma did you take your BP tablet?_\
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# PUBLIC ENTRY POINT — called from webhook.py background task
+# PUBLIC ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_child_message(child: dict, msg: dict) -> None:
-    """Route a child's incoming message to the correct command handler.
-
-    If the child is in an active multi-step flow, continue that flow instead
-    of parsing for a new command.
-
-    Args:
-        child: Row from the children table (includes id, phone, family_id, name).
-        msg:   Normalised message dict from the WhatsApp service
-               {phone, body, button_reply, is_voice_note, ...}.
-    """
+    """Route a child's incoming message to the correct command handler."""
     phone = child["phone"]
     body = (msg.get("body") or "").strip()
     text = body.lower()
 
-    # ── Ongoing multi-step flow takes priority ────────────────
+    # Ongoing multi-step flow takes priority
     if phone in _child_state:
         await _handle_flow_step(child, msg)
         return
 
-    # ── Route by command keyword ──────────────────────────────
     if text in ("menu", "help", "hi", "hello", "start", ""):
         await _cmd_menu(child)
 
@@ -154,6 +152,27 @@ async def handle_child_message(child: dict, msg: dict) -> None:
 
     elif text.startswith("ask "):
         await _cmd_ask(child, body)
+
+    elif text.startswith("pause"):
+        await _cmd_pause(child, body)
+
+    elif text.startswith("resume"):
+        await _cmd_resume(child, body)
+
+    elif text.startswith("travel"):
+        await _cmd_travel(child, body)
+
+    elif text == "special" or text.startswith("special "):
+        await _cmd_special_date_start(child)
+
+    elif text == "bio" or text.startswith("bio "):
+        await _cmd_bio_start(child)
+
+    elif text == "letter":
+        await _cmd_letter_start(child)
+
+    elif text == "note":
+        await _cmd_note_start(child)
 
     elif text == "add parent":
         await _cmd_add_parent_start(child)
@@ -180,19 +199,15 @@ async def handle_child_message(child: dict, msg: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# COMMAND HANDLERS
+# SIMPLE COMMANDS
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _cmd_menu(child: dict) -> None:
-    """Show the AYANA command list."""
     await send_message(child["phone"], COMMAND_MENU)
 
 
 async def _cmd_status(child: dict) -> None:
-    """Show today's check-in status for every parent in the family.
-
-    For each parent shows: # touchpoints replied / sent, and latest mood.
-    """
+    """Show today's check-in status for every parent in the family."""
     db = get_db()
     phone = child["phone"]
     family_id = child.get("family_id")
@@ -258,15 +273,7 @@ async def _cmd_status(child: dict) -> None:
 async def _cmd_report(child: dict, body: str) -> None:
     """Generate a health summary report.
 
-    Usage:
-      report                → all parents, today
-      report amma           → parent whose nickname matches "amma", today
-      report amma 7days     → "amma", last 7 days
-      report 7days          → all parents, last 7 days
-
-    Args:
-        child: Child record.
-        body:  Full command string (e.g. "report amma 7days").
+    Usage: report | report amma | report amma 7days | report 7days
     """
     db = get_db()
     phone = child["phone"]
@@ -276,8 +283,7 @@ async def _cmd_report(child: dict, body: str) -> None:
         await send_message(phone, "No parents set up yet. Send *add parent* to get started.")
         return
 
-    # ── Parse tokens after "report" ───────────────────────────
-    tokens = body.lower().split()[1:]  # drop "report"
+    tokens = body.lower().split()[1:]
     parent_filter: str | None = None
     days = 1
 
@@ -286,7 +292,7 @@ async def _cmd_report(child: dict, body: str) -> None:
         if days_match:
             days = min(int(days_match.group(1)), 30)
         else:
-            parent_filter = tok  # treat as parent nickname
+            parent_filter = tok
 
     try:
         q = (
@@ -332,7 +338,6 @@ async def _cmd_report(child: dict, body: str) -> None:
                 "not_well": moods.count("not_well"),
             }
 
-            # Collect unique concerns
             all_concerns: list[str] = []
             for c in checkins:
                 raw = c.get("concerns") or []
@@ -362,19 +367,11 @@ async def _cmd_report(child: dict, body: str) -> None:
 async def _cmd_ask(child: dict, body: str) -> None:
     """Queue a custom question for a parent's next check-in.
 
-    The question is stored in the parent's conversation_state.context under
-    "queued_questions" and will be sent as an extra touchpoint.
-
     Usage: ask amma did you take your BP tablet?
-
-    Args:
-        child: Child record (must have name field).
-        body:  Full command string.
     """
     phone = child["phone"]
     family_id = child.get("family_id")
 
-    # Expect: ["ask", "<parent_name>", "<question...>"]
     parts = body.split(None, 2)
     if len(parts) < 3:
         await send_message(
@@ -410,7 +407,6 @@ async def _cmd_ask(child: dict, body: str) -> None:
         parent = parents[0]
         today = date.today().isoformat()
 
-        # Upsert into conversation_state.context
         existing = (
             db.table("conversation_state")
             .select("id, context")
@@ -493,14 +489,7 @@ async def _cmd_settings(child: dict) -> None:
 
 
 async def _cmd_add_sibling(child: dict, raw_phone: str) -> None:
-    """Add a sibling / co-caregiver to the same family.
-
-    Creates a children row for the new phone and sends them an invite message.
-
-    Args:
-        child:     The requesting child (must have family_id).
-        raw_phone: Phone number string (may or may not include '+').
-    """
+    """Add a sibling / co-caregiver to the same family."""
     db = get_db()
     phone = child["phone"]
     family_id = child.get("family_id")
@@ -509,7 +498,6 @@ async def _cmd_add_sibling(child: dict, raw_phone: str) -> None:
         await send_message(phone, "No family set up yet. Send *add parent* first.")
         return
 
-    # Normalise to E.164
     sibling_phone = raw_phone.strip()
     if not sibling_phone.startswith("+"):
         sibling_phone = f"+{sibling_phone}"
@@ -536,7 +524,6 @@ async def _cmd_add_sibling(child: dict, raw_phone: str) -> None:
             f"Added *{sibling_phone}* to your family ✓\n"
             f"They can now send commands to AYANA.",
         )
-        # Invite the new sibling
         await send_message(
             sibling_phone,
             f"You've been added to AYANA by *{child.get('name', 'a family member')}*.\n\n"
@@ -549,35 +536,661 @@ async def _cmd_add_sibling(child: dict, raw_phone: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ADD PARENT — MULTI-STEP ONBOARDING FLOW
+# PAUSE / RESUME
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _cmd_add_parent_start(child: dict) -> None:
-    """Start the add-parent onboarding flow.
+async def _cmd_pause(child: dict, body: str) -> None:
+    """Pause a parent's check-ins for N days.
 
-    Steps:
-      waiting_name      → waiting_phone → waiting_language
-      → waiting_time    → waiting_routine → confirming
-      → (creates records)
+    Usage: pause | pause amma | pause amma 3days | pause amma 7
     """
+    db = get_db()
     phone = child["phone"]
-    _child_state[phone] = {"flow": "add_parent", "step": "waiting_name", "data": {}}
+    family_id = child.get("family_id")
 
+    if not family_id:
+        await send_message(phone, "No parents set up yet.")
+        return
+
+    tokens = body.lower().split()[1:]  # drop "pause"
+    parent_filter = None
+    days = 1
+
+    for tok in tokens:
+        m = re.match(r"^(\d+)\s*days?$", tok)
+        if m:
+            days = min(int(m.group(1)), 30)
+        elif tok.isdigit():
+            days = min(int(tok), 30)
+        else:
+            parent_filter = tok
+
+    until_date = (date.today() + timedelta(days=days)).isoformat()
+
+    try:
+        q = db.table("parents").select("id, nickname").eq("family_id", family_id)
+        if parent_filter:
+            q = q.ilike("nickname", f"%{parent_filter}%")
+        parents = q.execute().data or []
+
+        if not parents:
+            hint = f" matching '{parent_filter}'" if parent_filter else ""
+            await send_message(phone, f"No parent found{hint}.")
+            return
+
+        paused_names = []
+        for p in parents:
+            db.table("parents").update({"paused_until": until_date}).eq(
+                "id", p["id"]
+            ).execute()
+            paused_names.append(p["nickname"])
+
+        names = " and ".join(paused_names)
+        await send_message(
+            phone,
+            f"⏸️ Paused check-ins for *{names}* until *{until_date}* "
+            f"({days} day{'s' if days > 1 else ''}).\n\n"
+            f"Send *resume {paused_names[0].lower()}* to restart early.",
+        )
+
+    except Exception as e:
+        logger.error(f"Pause command error for {phone}: {e}", exc_info=True)
+        await send_message(phone, "Could not pause. Please try again.")
+
+
+async def _cmd_resume(child: dict, body: str) -> None:
+    """Resume a paused parent's check-ins immediately.
+
+    Usage: resume | resume amma
+    """
+    db = get_db()
+    phone = child["phone"]
+    family_id = child.get("family_id")
+
+    if not family_id:
+        await send_message(phone, "No parents set up yet.")
+        return
+
+    tokens = body.lower().split()[1:]
+    parent_filter = tokens[0] if tokens else None
+
+    try:
+        q = db.table("parents").select("id, nickname").eq("family_id", family_id)
+        if parent_filter:
+            q = q.ilike("nickname", f"%{parent_filter}%")
+        parents = q.execute().data or []
+
+        if not parents:
+            hint = f" matching '{parent_filter}'" if parent_filter else ""
+            await send_message(phone, f"No parent found{hint}.")
+            return
+
+        resumed = []
+        for p in parents:
+            db.table("parents").update({"paused_until": None}).eq(
+                "id", p["id"]
+            ).execute()
+            resumed.append(p["nickname"])
+
+        names = " and ".join(resumed)
+        await send_message(
+            phone,
+            f"▶️ Resumed check-ins for *{names}*.\n"
+            f"They'll get the next check-in at their scheduled time.",
+        )
+
+    except Exception as e:
+        logger.error(f"Resume command error for {phone}: {e}", exc_info=True)
+        await send_message(phone, "Could not resume. Please try again.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TRAVEL MODE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _cmd_travel(child: dict, body: str) -> None:
+    """Mark a parent as travelling — switches to travel-mode messages.
+
+    Usage: travel | travel amma | travel amma 3days
+    Travel mode adjusts touchpoints: "Safe journey!", "Did you reach?", etc.
+    """
+    db = get_db()
+    phone = child["phone"]
+    family_id = child.get("family_id")
+
+    if not family_id:
+        await send_message(phone, "No parents set up yet.")
+        return
+
+    tokens = body.lower().split()[1:]
+    parent_filter = None
+    days = 1
+
+    for tok in tokens:
+        m = re.match(r"^(\d+)\s*days?$", tok)
+        if m:
+            days = min(int(m.group(1)), 14)
+        elif tok.isdigit():
+            days = min(int(tok), 14)
+        else:
+            parent_filter = tok
+
+    try:
+        q = db.table("parents").select("id, nickname").eq("family_id", family_id)
+        if parent_filter:
+            q = q.ilike("nickname", f"%{parent_filter}%")
+        parents = q.execute().data or []
+
+        if not parents:
+            await send_message(phone, f"No parent found{f' matching {parent_filter}' if parent_filter else ''}.")
+            return
+
+        until_date = (date.today() + timedelta(days=days)).isoformat()
+        travel_names = []
+        for p in parents:
+            # Store travel mode in parent routine JSON
+            current_routine = db.table("parents").select("routine").eq("id", p["id"]).execute().data
+            routine = (current_routine[0].get("routine") or {}) if current_routine else {}
+            routine["travel_mode"] = True
+            routine["travel_until"] = until_date
+            db.table("parents").update({"routine": routine}).eq("id", p["id"]).execute()
+            travel_names.append(p["nickname"])
+
+        names = " and ".join(travel_names)
+        await send_message(
+            phone,
+            f"✈️ Travel mode activated for *{names}* until *{until_date}*.\n\n"
+            f"I'll adjust messages to travel check-ins: safe journey, did you reach, etc.\n\n"
+            f"Send *resume {travel_names[0].lower()}* to switch back early.",
+        )
+
+    except Exception as e:
+        logger.error(f"Travel command error for {phone}: {e}", exc_info=True)
+        await send_message(phone, "Could not set travel mode. Please try again.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SPECIAL DATES WIZARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _cmd_special_date_start(child: dict) -> None:
+    """Start the special date wizard — add birthdays, anniversaries, etc."""
+    phone = child["phone"]
+    _child_state[phone] = {
+        "flow": "special_date",
+        "step": "waiting_recipient",
+        "data": {},
+    }
     await send_message(
         phone,
-        "Let's add your parent to AYANA.\n\n"
-        "*What is your parent's name?*\n"
-        "_(The name you call them — Amma, Nanna, Appa, etc.)_\n\n"
-        "Send *cancel* at any time to stop.",
+        "🎂 *Special date wizard*\n\n"
+        "Whose special date is this?\n\n"
+        "Reply: *Amma*, *Nanna*, or *Both*\n\n"
+        "_Send *cancel* to stop._",
     )
 
 
-async def _handle_flow_step(child: dict, msg: dict) -> None:
-    """Continue an active multi-step flow.
+async def _special_date_flow(child: dict, body: str, state: dict) -> None:
+    """Drive the special date wizard forward."""
+    phone = child["phone"]
+    step = state["step"]
+    data = state["data"]
 
-    Dispatches to the correct flow handler based on state["flow"].
-    Handles the universal "cancel" command.
-    """
+    if step == "waiting_recipient":
+        body_l = body.lower()
+        if any(w in body_l for w in ("amma", "mom", "mother")):
+            data["recipient"] = "amma"
+        elif any(w in body_l for w in ("nanna", "dad", "father", "appa")):
+            data["recipient"] = "nanna"
+        elif "both" in body_l:
+            data["recipient"] = "both"
+        else:
+            await send_message(phone, "Please reply with *Amma*, *Nanna*, or *Both*.")
+            return
+
+        state["step"] = "waiting_type"
+        await send_message(
+            phone,
+            f"What type of special date?\n\n"
+            f"1️⃣ Birthday\n2️⃣ Anniversary\n3️⃣ Festival\n4️⃣ Custom",
+        )
+
+    elif step == "waiting_type":
+        type_map = {"1": "birthday", "birthday": "birthday", "2": "anniversary", "anniversary": "anniversary",
+                     "3": "festival", "festival": "festival", "4": "custom", "custom": "custom"}
+        date_type = type_map.get(body.lower().strip())
+        if not date_type:
+            await send_message(phone, "Reply with *1*, *2*, *3*, or *4*.")
+            return
+        data["date_type"] = date_type
+        state["step"] = "waiting_date"
+        await send_message(phone, "What date? Reply in *DD-MM* format (e.g. *15-08*)")
+
+    elif step == "waiting_date":
+        m = re.match(r"^(\d{1,2})[/-](\d{1,2})$", body.strip())
+        if not m:
+            await send_message(phone, "Please use DD-MM format (e.g. *25-12*).")
+            return
+        day_n, month_n = int(m.group(1)), int(m.group(2))
+        try:
+            date(2024, month_n, day_n)  # validate
+        except ValueError:
+            await send_message(phone, "Invalid date. Try again (e.g. *25-12*).")
+            return
+        data["day"] = day_n
+        data["month"] = month_n
+        state["step"] = "waiting_label"
+        await send_message(phone, "Give this date a name (e.g. *Amma's birthday*, *Wedding anniversary*)")
+
+    elif step == "waiting_label":
+        if len(body.strip()) < 3:
+            await send_message(phone, "Please enter a short name for this date.")
+            return
+        data["label"] = body.strip()
+
+        # Save to DB
+        try:
+            db = get_db()
+            family_id = child.get("family_id")
+            parents = db.table("parents").select("id, nickname").eq("family_id", family_id).eq("is_active", True).execute().data or []
+
+            if data["recipient"] != "both":
+                parents = [p for p in parents if data["recipient"] in p["nickname"].lower()]
+
+            year = date.today().year
+            date_value = date(year, data["month"], data["day"]).isoformat()
+
+            for p in parents:
+                db.table("special_dates").insert({
+                    "parent_id": p["id"],
+                    "date_type": data["date_type"],
+                    "label": data["label"],
+                    "date_value": date_value,
+                    "recurring": True,
+                }).execute()
+
+            names = ", ".join(p["nickname"] for p in parents)
+            await send_message(
+                phone,
+                f"✅ Special date saved!\n\n"
+                f"*{data['label']}* on *{data['day']:02d}-{data['month']:02d}* for *{names}*.\n\n"
+                f"I'll send a special message on that day.",
+            )
+        except Exception as e:
+            logger.error(f"Special date save failed: {e}", exc_info=True)
+            await send_message(phone, "Could not save the date. Please try again.")
+
+        if phone in _child_state:
+            del _child_state[phone]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BIO / ROUTINE EDITOR
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _cmd_bio_start(child: dict) -> None:
+    """Edit a parent's daily routine / bio post-onboarding."""
+    phone = child["phone"]
+    _child_state[phone] = {
+        "flow": "bio_edit",
+        "step": "waiting_parent",
+        "data": {},
+    }
+    await send_message(
+        phone,
+        "📝 *Edit parent routine*\n\n"
+        "Which parent's routine do you want to update?\n\n"
+        "Reply: *Amma*, *Nanna*, or the parent's name.\n\n"
+        "_Send *cancel* to stop._",
+    )
+
+
+async def _bio_edit_flow(child: dict, body: str, state: dict) -> None:
+    """Drive the bio/routine editor."""
+    phone = child["phone"]
+    step = state["step"]
+    data = state["data"]
+    db = get_db()
+    family_id = child.get("family_id")
+
+    if step == "waiting_parent":
+        parents = db.table("parents").select("id, nickname").eq("family_id", family_id).eq("is_active", True).execute().data or []
+        matched = [p for p in parents if body.lower() in p["nickname"].lower()]
+        if not matched:
+            await send_message(phone, f"No parent found matching '{body}'. Try again.")
+            return
+        data["parent_id"] = matched[0]["id"]
+        data["parent_name"] = matched[0]["nickname"]
+        state["step"] = "waiting_description"
+        await send_message(
+            phone,
+            f"Tell me about *{matched[0]['nickname']}'s* updated daily routine:\n\n"
+            f"• Wake time, activities, meal times\n"
+            f"• Any new medicines or conditions\n"
+            f"• Hobbies, interests, daily schedule\n\n"
+            f"_Write naturally — I'll extract the details._",
+        )
+
+    elif step == "waiting_description":
+        if len(body.strip()) < 20:
+            await send_message(phone, "Please share a bit more detail about their routine.")
+            return
+
+        try:
+            from app.services.gemini import extract_routine
+            routine = await extract_routine(body, data["parent_name"])
+
+            parent_id = data["parent_id"]
+            update_data = {
+                "activities": routine.activities,
+                "conditions": routine.conditions,
+                "alone_during_day": routine.alone_during_day,
+                "routine": {
+                    "wake_time": routine.wake_time,
+                    "notes": routine.notes,
+                },
+            }
+            db.table("parents").update(update_data).eq("id", parent_id).execute()
+
+            # Update medicines if new ones mentioned
+            if routine.medicines:
+                _create_medicine_groups(db, parent_id, routine.medicines)
+
+            summary_parts = []
+            if routine.activities:
+                summary_parts.append(f"Activities: {', '.join(routine.activities[:5])}")
+            if routine.conditions:
+                summary_parts.append(f"Conditions: {', '.join(routine.conditions[:5])}")
+            if routine.medicines:
+                summary_parts.append(f"Medicines: {len(routine.medicines)} found")
+
+            await send_message(
+                phone,
+                f"✅ Updated *{data['parent_name']}'s* routine!\n\n"
+                + "\n".join(f"• {s}" for s in summary_parts)
+                + "\n\nThis will be reflected in tomorrow's check-in messages.",
+            )
+
+        except Exception as e:
+            logger.error(f"Bio edit failed: {e}", exc_info=True)
+            await send_message(phone, "Could not update. Please try again.")
+
+        if phone in _child_state:
+            del _child_state[phone]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LETTER / NOTE WIZARDS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _cmd_letter_start(child: dict) -> None:
+    """Start the letter wizard — write a letter for a special date."""
+    phone = child["phone"]
+    _child_state[phone] = {
+        "flow": "letter",
+        "step": "waiting_recipient",
+        "data": {},
+    }
+    await send_message(
+        phone,
+        "💌 *Letter wizard*\n\n"
+        "Who is this letter for?\n\n"
+        "Reply: *Amma*, *Nanna*, or *Both*\n\n"
+        "_Send *cancel* to stop._",
+    )
+
+
+async def _cmd_note_start(child: dict) -> None:
+    """Start the note wizard — send a note in today's check-in."""
+    phone = child["phone"]
+    _child_state[phone] = {
+        "flow": "note",
+        "step": "waiting_recipient",
+        "data": {"is_note": True},
+    }
+    await send_message(
+        phone,
+        "📝 *Quick note*\n\nWho is this note for?\n\n"
+        "Reply: *Amma*, *Nanna*, or *Both*\n\n"
+        "_Send *cancel* to stop._",
+    )
+
+
+async def _letter_note_flow(child: dict, body: str, state: dict) -> None:
+    """Drive the letter and note wizards forward one step."""
+    phone = child["phone"]
+    step = state["step"]
+    data = state["data"]
+    is_note = data.get("is_note", False)
+
+    # ── Step 1: recipient ─────────────────────────────────────
+    if step == "waiting_recipient":
+        body_l = body.lower()
+        if any(w in body_l for w in ("amma", "mom", "mother", "maa")):
+            data["recipient"] = "amma"
+            label = "Amma"
+        elif any(w in body_l for w in ("nanna", "dad", "father", "appa")):
+            data["recipient"] = "nanna"
+            label = "Nanna"
+        elif "both" in body_l:
+            data["recipient"] = "both"
+            label = "both"
+        else:
+            await send_message(phone, "Please reply with *Amma*, *Nanna*, or *Both*.")
+            return
+
+        data["recipient_label"] = label
+        state["step"] = "waiting_delivery"
+
+        if is_note:
+            await send_message(
+                phone,
+                f"Got it — note for *{label}* ✓\n\n"
+                f"When should I deliver it?\n\n"
+                f"1️⃣ Morning check-in\n2️⃣ Evening check-in\n3️⃣ Now",
+            )
+        else:
+            await send_message(
+                phone,
+                f"Got it — letter for *{label}* ✓\n\n"
+                f"When should I deliver it?\n\n"
+                f"1️⃣ Birthday\n2️⃣ Anniversary\n3️⃣ Custom date (reply with DD-MM)\n4️⃣ Send now",
+            )
+
+    # ── Step 2: delivery timing ───────────────────────────────
+    elif step == "waiting_delivery":
+        body_l = body.lower().strip()
+
+        if is_note:
+            slot_map = {
+                "1": "morning_greeting",
+                "morning": "morning_greeting",
+                "2": "evening_checkin",
+                "evening": "evening_checkin",
+                "3": "now",
+                "now": "now",
+            }
+            slot = slot_map.get(body_l, "now")
+            data["delivery_slot"] = slot
+            state["step"] = "waiting_content"
+            slot_label = {
+                "morning_greeting": "morning",
+                "evening_checkin": "evening",
+                "now": "immediately",
+            }.get(slot, slot)
+            await send_message(
+                phone,
+                f"Delivering *{slot_label}* ✓\n\n"
+                f"Write your note for {data['recipient_label']}:",
+            )
+
+        else:
+            if body_l in ("1", "birthday"):
+                data["deliver_type"] = "birthday"
+                data["deliver_date"] = "birthday"
+            elif body_l in ("2", "anniversary"):
+                data["deliver_type"] = "anniversary"
+                data["deliver_date"] = "anniversary"
+            elif body_l in ("4", "now", "send now"):
+                data["deliver_type"] = "now"
+                data["deliver_date"] = date.today().isoformat()
+            else:
+                m = re.match(r"^(\d{1,2})[/-](\d{1,2})$", body.strip())
+                if m:
+                    day_n, month_n = int(m.group(1)), int(m.group(2))
+                    year = date.today().year
+                    try:
+                        d = date(year, month_n, day_n)
+                        if d < date.today():
+                            d = date(year + 1, month_n, day_n)
+                        data["deliver_type"] = "custom"
+                        data["deliver_date"] = d.isoformat()
+                    except ValueError:
+                        await send_message(phone, "That date doesn't look valid. Try *15-08* format.")
+                        return
+                else:
+                    await send_message(
+                        phone,
+                        "Please reply *1* (Birthday), *2* (Anniversary), "
+                        "*4* (Send now), or a date like *15-08*.",
+                    )
+                    return
+
+            state["step"] = "waiting_content"
+            date_label = data.get("deliver_date", "the chosen date")
+            await send_message(
+                phone,
+                f"Perfect — delivering on *{date_label}* ✓\n\n"
+                f"Write your letter for {data['recipient_label']}:\n\n"
+                f"_Write freely — I'll preserve your words exactly._",
+            )
+
+    # ── Step 3: content ───────────────────────────────────────
+    elif step == "waiting_content":
+        if len(body.strip()) < 5:
+            await send_message(phone, "Please write something for your parent. Even a few words.")
+            return
+
+        data["content"] = body.strip()
+        state["step"] = "confirming"
+
+        preview = body.strip()[:120] + ("..." if len(body.strip()) > 120 else "")
+        await send_message(
+            phone,
+            f"*Preview:*\n\n_{preview}_\n\n"
+            f"To: *{data['recipient_label']}*\n"
+            f"Deliver: *{data.get('deliver_date') or data.get('delivery_slot', 'now')}*\n\n"
+            f"Reply *YES* to send or *EDIT* to rewrite.",
+        )
+
+    # ── Step 4: confirm ───────────────────────────────────────
+    elif step == "confirming":
+        body_l = body.lower()
+        if body_l in ("edit", "rewrite", "change"):
+            state["step"] = "waiting_content"
+            await send_message(phone, "Write it again:")
+        elif body_l in ("yes", "y", "send", "ok", "confirm"):
+            await _save_and_deliver_letter(child, data)
+            if phone in _child_state:
+                del _child_state[phone]
+        else:
+            await send_message(phone, "Reply *YES* to send or *EDIT* to rewrite.")
+
+
+async def _save_and_deliver_letter(child: dict, data: dict) -> None:
+    """Save the letter/note to DB and deliver immediately if requested."""
+    phone = child["phone"]
+    family_id = child.get("family_id")
+    db = get_db()
+    is_note = data.get("is_note", False)
+
+    if not family_id:
+        await send_message(phone, "No family found. Cannot save.")
+        return
+
+    try:
+        recipient = data.get("recipient", "both")
+        parents = (
+            db.table("parents")
+            .select("id, nickname, phone, language, tts_voice")
+            .eq("family_id", family_id)
+            .eq("is_active", True)
+            .execute()
+            .data or []
+        )
+
+        if recipient != "both":
+            parents = [p for p in parents if recipient in p["nickname"].lower()]
+
+        if not parents:
+            await send_message(phone, "Could not find the parent to deliver to.")
+            return
+
+        deliver_now = (
+            data.get("deliver_type") == "now"
+            or data.get("delivery_slot") == "now"
+        )
+        child_name = child.get("name", "your child")
+
+        for parent in parents:
+            db.table("letters").insert({
+                "family_id":      family_id,
+                "from_child_id":  child["id"],
+                "to_parent_id":   parent["id"],
+                "content":        data["content"],
+                "deliver_date":   data.get("deliver_date") or date.today().isoformat(),
+                "deliver_slot":   data.get("delivery_slot", "morning_greeting"),
+                "letter_type":    "note" if is_note else "letter",
+                "status":         "delivered" if deliver_now else "pending",
+            }).execute()
+
+            if deliver_now:
+                from app.services import sarvam, whatsapp
+                msg_en = f"{child_name} sent this for you:\n\n{data['content']}"
+                try:
+                    audio_url, translated = await sarvam.english_to_parent_audio(
+                        msg_en, parent["language"], parent["tts_voice"], parent["nickname"]
+                    )
+                    await whatsapp.send_audio_and_buttons(
+                        to=parent["phone"],
+                        audio_url=audio_url or "",
+                        text=translated or msg_en,
+                    )
+                except Exception as e:
+                    logger.error(f"Letter audio delivery failed: {e}")
+                    from app.services.whatsapp import send_message as _send
+                    await _send(parent["phone"], f"{child_name} sent this for you:\n\n{data['content']}")
+
+        item_type = "note" if is_note else "letter"
+        delivered_label = (
+            "delivered now"
+            if deliver_now
+            else f"scheduled for {data.get('deliver_date', 'the chosen date')}"
+        )
+        await send_message(
+            phone,
+            f"✅ {item_type.title()} {delivered_label} for "
+            f"*{', '.join(p['nickname'] for p in parents)}*.",
+        )
+
+    except Exception as e:
+        logger.error(f"Letter save failed for {phone}: {e}", exc_info=True)
+        if "letters" in str(e).lower():
+            await send_message(
+                phone,
+                "⚠️ Letters table not set up yet. Run supabase_letters.sql first.\n\n"
+                f"Your message: _{data.get('content', '')[:300]}_",
+            )
+        else:
+            await send_message(phone, "Could not save. Please try again.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MULTI-STEP FLOW ROUTER
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _handle_flow_step(child: dict, msg: dict) -> None:
+    """Continue an active multi-step flow. Handles universal cancel."""
     phone = child["phone"]
     state = _child_state.get(phone)
     if not state:
@@ -593,21 +1206,38 @@ async def _handle_flow_step(child: dict, msg: dict) -> None:
     flow = state.get("flow")
     if flow == "add_parent":
         await _add_parent_flow(child, body, state)
+    elif flow in ("letter", "note"):
+        await _letter_note_flow(child, body, state)
+    elif flow == "special_date":
+        await _special_date_flow(child, body, state)
+    elif flow == "bio_edit":
+        await _bio_edit_flow(child, body, state)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ADD PARENT — MULTI-STEP ONBOARDING FLOW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _cmd_add_parent_start(child: dict) -> None:
+    """Start the add-parent onboarding flow."""
+    phone = child["phone"]
+    _child_state[phone] = {"flow": "add_parent", "step": "waiting_name", "data": {}}
+
+    await send_message(
+        phone,
+        "Let's add your parent to AYANA.\n\n"
+        "*What is your parent's name?*\n"
+        "_(The name you call them — Amma, Nanna, Appa, etc.)_\n\n"
+        "Send *cancel* at any time to stop.",
+    )
 
 
 async def _add_parent_flow(child: dict, body: str, state: dict) -> None:
-    """Drive the add-parent conversation forward one step.
-
-    Args:
-        child: Child record.
-        body:  Raw text of the child's reply.
-        state: Current flow state dict (mutated in place).
-    """
+    """Drive the add-parent conversation forward one step."""
     phone = child["phone"]
     step = state["step"]
     data = state["data"]
 
-    # ── Step 1: collect parent name ───────────────────────────
     if step == "waiting_name":
         if len(body) < 2:
             await send_message(phone, "Please enter a valid name (e.g. Amma, Nanna).")
@@ -624,7 +1254,6 @@ async def _add_parent_flow(child: dict, body: str, state: dict) -> None:
             f"Include country code (e.g. *+919876543210*)",
         )
 
-    # ── Step 2: collect parent phone ──────────────────────────
     elif step == "waiting_phone":
         p = body.strip()
         if not p.startswith("+"):
@@ -647,7 +1276,6 @@ async def _add_parent_flow(child: dict, body: str, state: dict) -> None:
         state["step"] = "waiting_language"
         await send_message(phone, _LANGUAGE_MENU)
 
-    # ── Step 3: select language ───────────────────────────────
     elif step == "waiting_language":
         try:
             idx = int(body.strip()) - 1
@@ -668,11 +1296,8 @@ async def _add_parent_flow(child: dict, body: str, state: dict) -> None:
                     f"Please reply with a number between 1 and {len(_LANGUAGE_LIST)}.",
                 )
         except ValueError:
-            await send_message(
-                phone, f"Please reply with a number (e.g. *1* for Telugu)."
-            )
+            await send_message(phone, "Please reply with a number (e.g. *1* for Telugu).")
 
-    # ── Step 4: collect check-in time ─────────────────────────
     elif step == "waiting_time":
         m = re.match(r"^(\d{1,2}):(\d{2})$", body.strip())
         if not m:
@@ -703,7 +1328,6 @@ async def _add_parent_flow(child: dict, body: str, state: dict) -> None:
             f"_Write naturally — I'll figure out the details._",
         )
 
-    # ── Step 5: collect routine description ───────────────────
     elif step == "waiting_routine":
         if len(body) < 20:
             await send_message(
@@ -727,7 +1351,6 @@ async def _add_parent_flow(child: dict, body: str, state: dict) -> None:
         )
         await send_message(phone, summary)
 
-    # ── Step 6: final confirmation ────────────────────────────
     elif step == "confirming":
         if body.lower() in ("yes", "y", "confirm", "ok", "okay"):
             await _create_parent_records(child, data)
@@ -739,30 +1362,17 @@ async def _add_parent_flow(child: dict, body: str, state: dict) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# RECORD CREATION  (called after onboarding confirmation)
+# RECORD CREATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _create_parent_records(child: dict, data: dict) -> None:
-    """Create all Supabase records for a new parent after onboarding.
-
-    Creates / updates:
-      - families row (if child has no family yet)
-      - parents row
-      - medicine_groups + medicines (from Gemini routine extraction)
-
-    Then sends a confirmation to the child and a welcome to the parent.
-
-    Args:
-        child: Child record (may have family_id = None if first parent).
-        data:  Collected onboarding data dict.
-    """
+    """Create all Supabase records for a new parent after onboarding."""
     phone = child["phone"]
     db = get_db()
 
     try:
         family_id = child.get("family_id")
 
-        # ── Ensure family exists ──────────────────────────────
         if not family_id:
             fam = db.table("families").insert({"plan": "trial"}).execute()
             family_id = fam.data[0]["id"]
@@ -771,23 +1381,21 @@ async def _create_parent_records(child: dict, data: dict) -> None:
             ).execute()
             logger.info(f"Created family {family_id} for child {phone}")
 
-        # ── Create parent ─────────────────────────────────────
         voice = _DEFAULT_VOICE.get(data["language"], "roopa")
         parent_resp = db.table("parents").insert(
             {
-                "family_id": family_id,
-                "phone": data["phone"],
-                "name": data["name"],
-                "nickname": data["nickname"],
-                "language": data["language"],
-                "tts_voice": voice,
+                "family_id":    family_id,
+                "phone":        data["phone"],
+                "name":         data["name"],
+                "nickname":     data["nickname"],
+                "language":     data["language"],
+                "tts_voice":    voice,
                 "checkin_time": data["checkin_time"],
             }
         ).execute()
         parent_id = parent_resp.data[0]["id"]
         logger.info(f"Created parent {parent_id} ({data['name']}) for family {family_id}")
 
-        # ── Extract routine with Gemini ───────────────────────
         routine_desc = data.get("routine_description", "")
         if routine_desc:
             try:
@@ -796,12 +1404,12 @@ async def _create_parent_records(child: dict, data: dict) -> None:
 
                 db.table("parents").update(
                     {
-                        "activities": routine.activities,
-                        "conditions": routine.conditions,
+                        "activities":     routine.activities,
+                        "conditions":     routine.conditions,
                         "alone_during_day": routine.alone_during_day,
                         "routine": {
                             "wake_time": routine.wake_time,
-                            "notes": routine.notes,
+                            "notes":     routine.notes,
                         },
                     }
                 ).eq("id", parent_id).execute()
@@ -809,16 +1417,16 @@ async def _create_parent_records(child: dict, data: dict) -> None:
                 if routine.medicines:
                     _create_medicine_groups(db, parent_id, routine.medicines)
 
-                logger.info(f"Routine extracted for parent {parent_id}: {len(routine.medicines)} med(s)")
+                logger.info(
+                    f"Routine extracted for parent {parent_id}: {len(routine.medicines)} med(s)"
+                )
 
             except Exception as e:
                 logger.error(
                     f"Routine extraction failed for parent {parent_id}: {e}",
                     exc_info=True,
                 )
-                # Non-fatal — parent record still created
 
-        # ── Confirmation to child ─────────────────────────────
         await send_message(
             phone,
             f"*{data['name']} is now set up in AYANA!* ✅\n\n"
@@ -828,7 +1436,6 @@ async def _create_parent_records(child: dict, data: dict) -> None:
             f"(Twilio sandbox requirement).",
         )
 
-        # ── Welcome message to parent ─────────────────────────
         await send_message(
             data["phone"],
             f"Namaste! I'm *AYANA*, your daily care companion 🙏\n\n"
@@ -839,16 +1446,13 @@ async def _create_parent_records(child: dict, data: dict) -> None:
         )
 
     except Exception as e:
-        logger.error(
-            f"Parent record creation failed for {phone}: {e}", exc_info=True
-        )
+        logger.error(f"Parent record creation failed for {phone}: {e}", exc_info=True)
         await send_message(
             phone,
             "Something went wrong while setting up the parent. Please try again.",
         )
 
     finally:
-        # Always clean up flow state
         if phone in _child_state:
             del _child_state[phone]
 
@@ -858,17 +1462,7 @@ async def _create_parent_records(child: dict, data: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _create_medicine_groups(db, parent_id: str, medicines: list[dict]) -> None:
-    """Create medicine_groups and medicines rows from Gemini's routine extraction.
-
-    Groups medicines by their anchor event (before_food, after_food, etc.)
-    and inserts one medicine_group per anchor with its medicines as children.
-
-    Args:
-        db:         Supabase client.
-        parent_id:  UUID of the parent record.
-        medicines:  List of medicine dicts from RoutineExtraction.medicines.
-    """
-    # Group by anchor event
+    """Create medicine_groups and medicines from Gemini routine extraction."""
     groups: dict[str, list[dict]] = {}
     for med in medicines:
         timing = med.get("timing", "after_food")
@@ -877,19 +1471,19 @@ def _create_medicine_groups(db, parent_id: str, medicines: list[dict]) -> None:
 
     for sort_order, (anchor, meds) in enumerate(groups.items()):
         try:
-            # Use the first medicine's time_estimate, or the anchor default
-            raw_time = meds[0].get("time_estimate", _ANCHOR_DEFAULT_TIME.get(anchor, "08:00"))
-            # Ensure HH:MM format
+            raw_time = meds[0].get(
+                "time_estimate", _ANCHOR_DEFAULT_TIME.get(anchor, "08:00")
+            )
             if not re.match(r"^\d{1,2}:\d{2}$", str(raw_time)):
                 raw_time = _ANCHOR_DEFAULT_TIME.get(anchor, "08:00")
 
             grp = db.table("medicine_groups").insert(
                 {
-                    "parent_id": parent_id,
-                    "label": _ANCHOR_LABEL.get(anchor, anchor.replace("_", " ").title()),
+                    "parent_id":    parent_id,
+                    "label":        _ANCHOR_LABEL.get(anchor, anchor.replace("_", " ").title()),
                     "anchor_event": anchor,
-                    "time_window": raw_time,
-                    "sort_order": sort_order,
+                    "time_window":  raw_time,
+                    "sort_order":   sort_order,
                 }
             ).execute()
 
@@ -898,11 +1492,11 @@ def _create_medicine_groups(db, parent_id: str, medicines: list[dict]) -> None:
             for med in meds:
                 db.table("medicines").insert(
                     {
-                        "group_id": group_id,
-                        "name": med.get("name", "medicine"),
-                        "display_name": med.get("display_name") or med.get("name", "medicine"),
-                        "instructions": med.get("instructions", ""),
-                        "is_as_needed": med.get("timing") == "as_needed",
+                        "group_id":        group_id,
+                        "name":            med.get("name", "medicine"),
+                        "display_name":    med.get("display_name") or med.get("name", "medicine"),
+                        "instructions":    med.get("instructions", ""),
+                        "is_as_needed":    med.get("timing") == "as_needed",
                         "trigger_symptom": med.get("trigger_symptom"),
                     }
                 ).execute()

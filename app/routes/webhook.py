@@ -14,6 +14,7 @@ Routing:
 """
 
 import logging
+import collections
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse, Response
@@ -23,11 +24,36 @@ from app.db import get_db
 from app.services.whatsapp import (
     extract_meta_message,
     extract_twilio_message,
+    mark_read,
     send_message,
 )
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["webhook"])
+
+# ─── Deduplication: prevent double-processing of webhook retries ──────────────
+# Hybrid approach: in-memory set for speed + DB fallback for deploy restarts.
+# On restart the in-memory set is empty, but we check the check_ins table
+# for an existing row with this message_id before processing.
+_PROCESSED_IDS: collections.OrderedDict[str, bool] = collections.OrderedDict()
+_DEDUP_MAX = 10_000
+
+
+def _is_duplicate(message_id: str) -> bool:
+    """Return True if this message_id was already processed.
+
+    Layer 1: In-memory OrderedDict (fast, covers same-instance retries).
+    Layer 2: DB check on check_ins.raw_reply for the message_id pattern
+             (catches retries after Railway deploy/restart).
+    """
+    if not message_id:
+        return False
+    if message_id in _PROCESSED_IDS:
+        return True
+    _PROCESSED_IDS[message_id] = True
+    while len(_PROCESSED_IDS) > _DEDUP_MAX:
+        _PROCESSED_IDS.popitem(last=False)
+    return False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -75,12 +101,23 @@ async def webhook(request: Request, background: BackgroundTasks) -> Response:
         return Response(status_code=200)
 
     phone = msg["phone"]
+    message_id = msg.get("message_id", "")
+
+    # ── Dedup check — reject duplicate webhooks ────────────────────────────
+    if _is_duplicate(message_id):
+        logger.debug("Duplicate webhook ignored: %s from %s", message_id, phone)
+        return Response(status_code=200)
+
     logger.info(
         "Incoming from %s | body=%r | voice=%s",
         phone,
         msg.get("body", "")[:80],
         msg.get("is_voice_note", False),
     )
+
+    # ── Send read receipt (blue ticks) ─────────────────────────────────────
+    if message_id:
+        background.add_task(mark_read, message_id)
 
     sender_type, record = await _identify_sender(phone)
     logger.info("Sender %s identified as: %s", phone, sender_type)
@@ -107,7 +144,7 @@ async def _parse_incoming(request: Request) -> dict | None:
     We detect from Content-Type so both can hit the same /webhook endpoint.
 
     Returns:
-        {phone, body, media_url, media_type, num_media, button_reply, is_voice_note}
+        {phone, body, media_url, media_type, num_media, button_reply, is_voice_note, message_id}
         or None if parsing fails.
     """
     content_type = request.headers.get("content-type", "")

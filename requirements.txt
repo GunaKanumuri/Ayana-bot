@@ -1,11 +1,16 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-supabase==2.9.1
+supabase==2.13.0
 python-dotenv==1.0.1
 apscheduler==3.10.4
 httpx==0.27.2
 pydantic==2.9.2
 python-dateutil==2.9.0
 twilio==9.3.0
-google-generativeai==0.8.3
 python-multipart==0.0.12
+
+# Gemini — use google-genai (NEW SDK), not google-generativeai
+google-genai==1.5.0
+
+# structlog for production logging (used in Task 10, add now)
+structlog==24.4.0

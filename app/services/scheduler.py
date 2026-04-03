@@ -5,52 +5,35 @@ Architecture
 One BackgroundScheduler runs a single job every 5 minutes:
   _main_loop() → asyncio.run(_async_main_loop())
 
-Inside _async_main_loop() five checks happen every tick:
+Inside _async_main_loop() six checks happen every tick:
 
   1. Morning check-ins
      For every active parent whose checkin_time falls within the current
-     5-minute window, start_daily_conversation() is called if today's
-     conversation_state doesn't already exist.
+     5-minute window, advance_health_flows() is called first, then
+     start_daily_conversation() if today's conversation_state doesn't exist.
 
   2. Medicine reminders
      For every medicine_group whose time_window falls in the window,
      send a standalone reminder IF the corresponding check_in for today
-     hasn't already been sent (guards against double-sending when the
-     conversation flow already covers it).
+     hasn't already been sent.
 
   3. Nudge (3 h after unanswered morning check-in)
-     If the parent's morning_greeting check_in has status=sent and
-     sent_at < now-3h, and nudge_sent is False in conversation_state,
-     call send_nudge() and flip nudge_sent=True.
 
   4. Missed check (6 h after unanswered check-in)
-     Any check_in with status=sent and sent_at < now-6h is marked
-     status=missed and an alert is sent to the family children.
 
-  5. Evening reports
-     For every child whose report_time falls in the window, call
-     generate_daily_report(family_id) once per family per day.
-     Sunday ticks also call generate_weekly_report().
+  5. Evening reports (daily + weekly on Sundays)
 
-Timezone
-────────
-All comparisons use Asia/Kolkata (IST, UTC+5:30).
-checkin_time / time_window / report_time are stored as TIME in Supabase
-and come back as "HH:MM:SS" strings — we compare only the HH:MM part.
+  6. Letter / note deliveries
+     Any pending letters whose deliver_date is today get delivered.
 
-Thread safety
-─────────────
-APScheduler BackgroundScheduler runs jobs in a thread pool.
-max_instances=1 ensures the 5-minute job never overlaps itself.
-async code is executed via asyncio.run() — each job call gets its own
-event loop, completely separate from FastAPI's event loop.
+Timezone: Asia/Kolkata (IST, UTC+5:30)
 """
 
 import asyncio
 import logging
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta
 
-import pytz
+from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
@@ -59,18 +42,12 @@ from app.db import get_db
 
 logger = logging.getLogger(__name__)
 
-# ── Module-level scheduler instance ──────────────────────────────────────────
 _scheduler: BackgroundScheduler | None = None
 
-# ── Per-day deduplication for evening reports ─────────────────────────────────
-# { family_id: "YYYY-MM-DD" }  — cleared implicitly (date changes each day)
 _daily_reports_sent:  dict[str, str] = {}
 _weekly_reports_sent: dict[str, str] = {}
 
-# IST timezone object
-_IST = pytz.timezone(settings.TIMEZONE)
-
-# How wide the matching window is (should be >= scheduler interval)
+_IST = ZoneInfo(settings.TIMEZONE)
 _WINDOW_MINS = 4
 
 
@@ -79,11 +56,7 @@ _WINDOW_MINS = 4
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def start_scheduler() -> None:
-    """Start the APScheduler BackgroundScheduler.
-
-    Registers one IntervalTrigger job that runs every 5 minutes.
-    Called from FastAPI lifespan on startup.
-    """
+    """Start the APScheduler BackgroundScheduler."""
     global _scheduler
 
     _scheduler = BackgroundScheduler(
@@ -102,7 +75,7 @@ def start_scheduler() -> None:
 
 
 def stop_scheduler() -> None:
-    """Gracefully shut down the scheduler. Called from FastAPI lifespan on shutdown."""
+    """Gracefully shut down the scheduler."""
     global _scheduler
     if _scheduler and _scheduler.running:
         _scheduler.shutdown(wait=False)
@@ -110,7 +83,7 @@ def stop_scheduler() -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SYNC ENTRY POINT (APScheduler calls this in a thread)
+# SYNC ENTRY POINT
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def _main_loop() -> None:
@@ -126,11 +99,7 @@ def _main_loop() -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _async_main_loop() -> None:
-    """Core polling logic — executed every 5 minutes.
-
-    All five checks run sequentially; individual failures are caught and logged
-    so one bad check never prevents the others from running.
-    """
+    """Core polling logic — executed every 5 minutes."""
     now_ist   = datetime.now(_IST)
     hhmm      = now_ist.strftime("%H:%M")
     today     = now_ist.date().isoformat()
@@ -138,21 +107,27 @@ async def _async_main_loop() -> None:
 
     logger.debug(f"Scheduler tick — IST {hhmm} ({today})")
 
-    # Run all checks; each has its own try/except
     await _check_morning_greetings(hhmm, today)
     await _check_medicine_reminders(hhmm, today)
+    await _check_medicine_retries(today)
     await _check_nudges(today)
     await _check_missed_checkins(today)
     await _check_evening_reports(hhmm, today, is_sunday)
+    await _check_letter_deliveries(today)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 1 — MORNING GREETINGS
+# CHECK 1 — MORNING GREETINGS  (+ health flow advance)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_morning_greetings(hhmm: str, today: str) -> None:
-    """Start daily conversation for every parent whose checkin_time is now."""
+    """Start daily conversation for every parent whose checkin_time is now.
+
+    Before starting the conversation, advances any active health flows by one
+    day so the greeting reflects the parent's current recovery state.
+    """
     from app.services.conversation import start_daily_conversation
+    from app.engine.health_flow import advance_health_flows
 
     db = get_db()
     try:
@@ -169,7 +144,6 @@ async def _check_morning_greetings(hhmm: str, today: str) -> None:
 
     for parent in parents:
         try:
-            # Skip paused parents
             paused = parent.get("paused_until")
             if paused and str(paused) >= today:
                 continue
@@ -190,6 +164,15 @@ async def _check_morning_greetings(hhmm: str, today: str) -> None:
             if existing:
                 continue
 
+            # Advance health flows before starting conversation
+            # This ensures morning_greeting reflects correct health state
+            try:
+                await advance_health_flows(parent["id"])
+            except Exception as hf_err:
+                logger.warning(
+                    f"[scheduler] health_flow advance failed for {parent['phone']}: {hf_err}"
+                )
+
             logger.info(
                 f"[scheduler] Starting conversation for {parent['nickname']} "
                 f"({parent['phone']}) at {hhmm} IST"
@@ -208,18 +191,17 @@ async def _check_morning_greetings(hhmm: str, today: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_medicine_reminders(hhmm: str, today: str) -> None:
-    """Send standalone medicine reminders for groups whose time_window is now.
-
-    Skips if the corresponding check_in touchpoint was already sent today
-    (which means the Gemini-planned conversation already covered it).
-    """
+    """Send standalone medicine reminders for groups whose time_window is now."""
     from app.services.conversation import send_medicine_reminder
 
     db = get_db()
     try:
         groups = (
             db.table("medicine_groups")
-            .select("*, medicines(*), parents(id, phone, nickname, language, tts_voice, is_active, paused_until, family_id)")
+            .select(
+                "*, medicines(*), "
+                "parents(id, phone, nickname, language, tts_voice, is_active, paused_until, family_id)"
+            )
             .execute()
             .data or []
         )
@@ -227,7 +209,6 @@ async def _check_medicine_reminders(hhmm: str, today: str) -> None:
         logger.error(f"[scheduler] medicine_groups fetch failed: {e}")
         return
 
-    # Map anchor_event → touchpoint_type (mirrors conversation.py)
     anchor_to_tp = {
         "wake":        "medicine_before_food",
         "before_food": "medicine_before_food",
@@ -256,7 +237,6 @@ async def _check_medicine_reminders(hhmm: str, today: str) -> None:
             anchor  = grp.get("anchor_event", "after_food")
             tp_type = anchor_to_tp.get(anchor, "medicine_after_food")
 
-            # Already sent today via conversation flow?
             existing = (
                 db.table("check_ins")
                 .select("id")
@@ -287,6 +267,106 @@ async def _check_medicine_reminders(hhmm: str, today: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHECK 2b — MEDICINE RETRIES (picks up "will take soon" / "remind later")
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _check_medicine_retries(today: str) -> None:
+    """Re-send medicine reminders when parent said 'will take soon'.
+
+    conversation.py writes medicine_retry_at into conversation_state.context.
+    This function checks if the retry time has passed and the medicine
+    touchpoint still has status=replied with action=medicine_later.
+    """
+    from app.services.conversation import send_medicine_reminder
+
+    db = get_db()
+    now_utc = datetime.utcnow().isoformat()
+
+    try:
+        states = (
+            db.table("conversation_state")
+            .select("id, parent_id, context")
+            .eq("date", today)
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        logger.error(f"[scheduler] medicine retry state fetch failed: {e}")
+        return
+
+    for state in states:
+        ctx = state.get("context") or {}
+        retry_at = ctx.get("medicine_retry_at")
+        if not retry_at or retry_at > now_utc:
+            continue
+
+        parent_id = state["parent_id"]
+        group_id = ctx.get("medicine_retry_group_id")
+        retry_count = ctx.get("medicine_retry_count", 0)
+
+        try:
+            # Check if medicine was taken since the retry was scheduled
+            med_checkins = (
+                db.table("check_ins")
+                .select("medicine_taken")
+                .eq("parent_id", parent_id)
+                .eq("date", today)
+                .like("touchpoint", "medicine_%")
+                .eq("status", "replied")
+                .execute()
+                .data or []
+            )
+            already_taken = any(
+                isinstance(c.get("medicine_taken"), dict) and c["medicine_taken"].get("taken")
+                for c in med_checkins
+            )
+            if already_taken:
+                # Clear retry — medicine was taken
+                ctx.pop("medicine_retry_at", None)
+                ctx.pop("medicine_retry_count", None)
+                ctx.pop("medicine_retry_group_id", None)
+                db.table("conversation_state").update({"context": ctx}).eq("id", state["id"]).execute()
+                continue
+
+            # Load parent and medicine group for re-send
+            parent_rows = (
+                db.table("parents")
+                .select("id, phone, nickname, language, tts_voice, is_active, family_id")
+                .eq("id", parent_id)
+                .eq("is_active", True)
+                .execute()
+                .data
+            )
+            if not parent_rows:
+                continue
+            parent = parent_rows[0]
+
+            if group_id:
+                grp_rows = (
+                    db.table("medicine_groups")
+                    .select("*, medicines(*)")
+                    .eq("id", group_id)
+                    .execute()
+                    .data
+                )
+                if grp_rows:
+                    logger.info(
+                        f"[scheduler] Medicine retry #{retry_count} for {parent['phone']}"
+                    )
+                    await send_medicine_reminder(parent, grp_rows[0])
+
+            # Clear the retry (max 2 retries enforced by conversation.py)
+            ctx.pop("medicine_retry_at", None)
+            db.table("conversation_state").update({"context": ctx}).eq("id", state["id"]).execute()
+
+        except Exception as e:
+            logger.error(
+                f"[scheduler] Medicine retry failed for parent {parent_id}: {e}",
+                exc_info=True,
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # CHECK 3 — NUDGE (3 h after unanswered morning check-in)
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -298,7 +378,6 @@ async def _check_nudges(today: str) -> None:
     cutoff = (datetime.utcnow() - timedelta(hours=3)).isoformat()
 
     try:
-        # Find morning_greeting check-ins that are still 'sent' and older than 3 h
         stale = (
             db.table("check_ins")
             .select("parent_id, date, sent_at")
@@ -316,7 +395,6 @@ async def _check_nudges(today: str) -> None:
     for ci in stale:
         parent_id = ci["parent_id"]
         try:
-            # Check nudge_sent flag
             state = (
                 db.table("conversation_state")
                 .select("id, nudge_sent")
@@ -328,7 +406,6 @@ async def _check_nudges(today: str) -> None:
             if not state or state[0].get("nudge_sent"):
                 continue
 
-            # Load parent
             parent_rows = (
                 db.table("parents")
                 .select("id, phone, nickname, language, tts_voice, family_id")
@@ -344,7 +421,6 @@ async def _check_nudges(today: str) -> None:
             logger.info(f"[scheduler] Sending nudge to {parent['phone']}")
             await send_nudge(parent)
 
-            # Mark nudge as sent
             db.table("conversation_state").update({"nudge_sent": True}).eq(
                 "id", state[0]["id"]
             ).execute()
@@ -383,16 +459,13 @@ async def _check_missed_checkins(today: str) -> None:
     for ci in stale:
         parent_id = ci["parent_id"]
         try:
-            # Mark missed
             db.table("check_ins").update({"status": "missed"}).eq(
                 "id", ci["id"]
             ).execute()
 
-            # Only alert once per day per parent (on the morning_greeting)
             if ci["touchpoint"] != "morning_greeting":
                 continue
 
-            # Load parent + family children
             parent_rows = (
                 db.table("parents")
                 .select("nickname, family_id")
@@ -402,11 +475,11 @@ async def _check_missed_checkins(today: str) -> None:
             )
             if not parent_rows:
                 continue
-            parent     = parent_rows[0]
-            family_id  = parent["family_id"]
-            nickname   = parent["nickname"]
 
-            # Create missed_checkin alert
+            parent    = parent_rows[0]
+            family_id = parent["family_id"]
+            nickname  = parent["nickname"]
+
             db.table("alerts").insert(
                 {
                     "family_id": family_id,
@@ -417,7 +490,6 @@ async def _check_missed_checkins(today: str) -> None:
                 }
             ).execute()
 
-            # Notify children
             children = (
                 db.table("children")
                 .select("phone, name")
@@ -450,11 +522,7 @@ async def _check_missed_checkins(today: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None:
-    """Send daily (and weekly on Sunday) reports at each child's report_time.
-
-    Uses _daily_reports_sent / _weekly_reports_sent dicts for per-day
-    deduplication so the same family never gets two reports on the same day.
-    """
+    """Send daily (and weekly on Sunday) reports at each child's report_time."""
     from app.services.report import generate_daily_report, generate_weekly_report
 
     db = get_db()
@@ -469,7 +537,6 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
         logger.error(f"[scheduler] children fetch for reports failed: {e}")
         return
 
-    # Deduplicate by family (multiple children in same family share same report)
     seen_families: set[str] = set()
 
     for child in children:
@@ -484,7 +551,6 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
 
         seen_families.add(family_id)
 
-        # ── Daily report ──────────────────────────────────────
         if _daily_reports_sent.get(family_id) != today:
             try:
                 logger.info(f"[scheduler] Generating daily report for family {family_id}")
@@ -496,7 +562,6 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
                     exc_info=True,
                 )
 
-        # ── Weekly report (Sundays only) ──────────────────────
         if is_sunday and _weekly_reports_sent.get(family_id) != today:
             try:
                 logger.info(f"[scheduler] Generating weekly report for family {family_id}")
@@ -510,6 +575,88 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# CHECK 6 — LETTER / NOTE DELIVERIES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def _check_letter_deliveries(today: str) -> None:
+    """Deliver any pending letters/notes whose deliver_date is today.
+
+    Marks each letter as delivered (or failed) after processing so it
+    never fires twice.
+    """
+    from app.services import sarvam, whatsapp
+
+    db = get_db()
+    try:
+        letters = (
+            db.table("letters")
+            .select(
+                "*, "
+                "parents(id, phone, nickname, language, tts_voice), "
+                "children(name)"
+            )
+            .eq("deliver_date", today)
+            .eq("status", "pending")
+            .execute()
+            .data or []
+        )
+    except Exception as e:
+        # Table may not exist yet — fail silently
+        if "letters" not in str(e).lower():
+            logger.error(f"[scheduler] letters fetch failed: {e}")
+        return
+
+    for letter in letters:
+        try:
+            parent = letter.get("parents")
+            if not parent:
+                continue
+
+            child_name = (letter.get("children") or {}).get("name", "your child")
+            content    = letter["content"]
+            msg_en     = f"{child_name} sent this for you:\n\n{content}"
+
+            try:
+                audio_url, translated = await sarvam.english_to_parent_audio(
+                    msg_en,
+                    parent["language"],
+                    parent["tts_voice"],
+                    parent["nickname"],
+                )
+                await whatsapp.send_audio_and_buttons(
+                    to=parent["phone"],
+                    audio_url=audio_url or "",
+                    text=translated or msg_en,
+                )
+            except Exception as send_err:
+                logger.warning(
+                    f"[scheduler] Letter audio failed, falling back to text: {send_err}"
+                )
+                await whatsapp.send_message(parent["phone"], msg_en)
+
+            db.table("letters").update(
+                {
+                    "status":       "delivered",
+                    "delivered_at": datetime.utcnow().isoformat(),
+                }
+            ).eq("id", letter["id"]).execute()
+
+            logger.info(f"[scheduler] Letter delivered to {parent['phone']}")
+
+        except Exception as e:
+            logger.error(
+                f"[scheduler] Letter delivery failed for {letter.get('id')}: {e}",
+                exc_info=True,
+            )
+            try:
+                db.table("letters").update({"status": "failed"}).eq(
+                    "id", letter["id"]
+                ).execute()
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # UTILITY
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -517,20 +664,11 @@ def _in_window(current_hhmm: str, target_hhmm: str, window: int = _WINDOW_MINS) 
     """Return True if current_hhmm is within `window` minutes of target_hhmm.
 
     Handles midnight wrap-around (e.g. 23:58 vs 00:01 are 3 minutes apart).
-
-    Args:
-        current_hhmm: Current time as "HH:MM".
-        target_hhmm:  Scheduled time as "HH:MM" (leading zeros optional).
-        window:       Tolerance in minutes (default 4).
-
-    Returns:
-        True if within window, False otherwise.
     """
     try:
         ch, cm = map(int, current_hhmm[:5].split(":"))
         th, tm = map(int, target_hhmm[:5].split(":"))
         diff = abs((ch * 60 + cm) - (th * 60 + tm))
-        # Wrap around midnight
         diff = min(diff, 1440 - diff)
         return diff <= window
     except Exception:

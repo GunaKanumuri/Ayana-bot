@@ -354,9 +354,28 @@ async def _build_daily_parent_block(db, parent: dict, today: date) -> str:
     else:
         concern_line = "✅ Concerns: None today"
 
+    # ── AI Observation (warm one-liner from Gemini) ─────────────────────────────
+    ai_observation = ""
+    try:
+        from app.services.gemini import generate_daily_observation
+        ai_observation = await generate_daily_observation(
+            parent_nickname=nickname,
+            mood=latest_mood,
+            concerns=all_concerns,
+            medicine_status=medicine_line,
+            response_rate=f"{n_replied}/{total}",
+        )
+        if ai_observation:
+            ai_observation = f"\n💡 _{ai_observation}_"
+    except Exception as e:
+        logger.warning("AI observation generation failed for %s: %s", nickname, e)
+
     # ── Assemble block ──────────────────────────────────────────────────────────
     lines = [f"*{nickname}*", mood_line, medicine_line, food_line, response_line, concern_line]
-    return "\n".join(line for line in lines if line)
+    block = "\n".join(line for line in lines if line)
+    if ai_observation:
+        block += ai_observation
+    return block
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

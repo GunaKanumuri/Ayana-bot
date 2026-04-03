@@ -52,8 +52,7 @@ async def text_to_speech(
                         "inputs": [text],
                         "target_language_code": sarvam_lang,
                         "speaker": speaker,
-                        "model": "bulbul:v2",
-                        "enable_preprocessing": True,
+                        "model": "bulbul:v3",
                     },
                 )
                 resp.raise_for_status()
@@ -70,6 +69,15 @@ async def text_to_speech(
                 
         except httpx.TimeoutException:
             logger.warning(f"Sarvam TTS timeout (attempt {attempt + 1}/{MAX_RETRIES})")
+        except httpx.HTTPStatusError as e:
+            body = ""
+            try:
+                body = e.response.text
+            except Exception:
+                pass
+            logger.error(f"Sarvam TTS HTTP {e.response.status_code} (attempt {attempt + 1}): {body}")
+            if attempt == MAX_RETRIES - 1:
+                return None
         except Exception as e:
             logger.error(f"Sarvam TTS error (attempt {attempt + 1}): {e}")
             if attempt == MAX_RETRIES - 1:
@@ -83,25 +91,54 @@ async def save_tts_audio(
     language: str = "te",
     speaker: str = "roopa",
 ) -> str | None:
-    """Generate TTS and save to a temporary file. Returns file path.
-    
-    Note: In production, upload to Supabase Storage or S3 and return public URL.
-    For dev, we save locally and serve via FastAPI static files.
+    """Generate TTS and save to Supabase Storage. Returns public URL.
+
+    Uses a content-hash key so identical text+language+speaker combos
+    are cached automatically. Falls back to /tmp/ if Supabase Storage
+    is not configured or fails.
     """
+    import hashlib
     audio_bytes = await text_to_speech(text, language, speaker)
     if not audio_bytes:
         return None
-    
-    # Save to temp file
-    os.makedirs("/tmp/ayana_audio", exist_ok=True)
-    import hashlib
+
     filename = hashlib.md5(f"{text}{language}{speaker}".encode()).hexdigest()
+    file_key = f"tts/{filename}.wav"
+
+    # Try Supabase Storage first (persists across deploys)
+    try:
+        from app.db import get_db
+        db = get_db()
+        # Check if already cached
+        try:
+            existing = db.storage.from_("audio_cache").get_public_url(file_key)
+            if existing:
+                # Verify it actually exists by trying to download headers
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.head(existing)
+                    if resp.status_code == 200:
+                        return existing
+        except Exception:
+            pass
+
+        # Upload to Supabase Storage
+        db.storage.from_("audio_cache").upload(
+            file_key,
+            audio_bytes,
+            file_options={"content-type": "audio/wav", "upsert": "true"},
+        )
+        public_url = db.storage.from_("audio_cache").get_public_url(file_key)
+        logger.info(f"TTS audio cached to Supabase: {file_key}")
+        return public_url
+
+    except Exception as e:
+        logger.warning(f"Supabase Storage upload failed, falling back to /tmp: {e}")
+
+    # Fallback: local /tmp/ (works for dev, resets on deploy)
+    os.makedirs("/tmp/ayana_audio", exist_ok=True)
     filepath = f"/tmp/ayana_audio/{filename}.wav"
-    
     with open(filepath, "wb") as f:
         f.write(audio_bytes)
-    
-    # Return public URL (via FastAPI static mount)
     return f"{settings.APP_URL}/audio/{filename}.wav"
 
 
@@ -201,7 +238,7 @@ async def translate(
                         "input": text,
                         "source_language_code": src,
                         "target_language_code": tgt,
-                        "mode": "colloquial",
+                        "mode": "modern-colloquial",
                         "model": "mayura:v1",
                         "enable_preprocessing": True,
                     },

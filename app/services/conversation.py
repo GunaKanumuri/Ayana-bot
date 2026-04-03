@@ -121,6 +121,39 @@ async def send_touchpoint(parent: dict, touchpoint_data: dict) -> bool:
     tp_type    = touchpoint_data.get("touchpoint_type", "")
     today      = date.today().isoformat()
 
+    # ── 0. WA 24h session window — first message of day needs template ─────────
+    is_first_message_today = False
+    try:
+        existing_today = (
+            db.table("check_ins")
+            .select("id")
+            .eq("parent_id", parent_id)
+            .eq("date", today)
+            .limit(1)
+            .execute()
+            .data
+        )
+        is_first_message_today = not existing_today
+    except Exception:
+        pass
+
+    if is_first_message_today:
+        # Send template to open the 24h session window (Meta Cloud API requirement)
+        try:
+            await whatsapp.send_template(
+                to=phone,
+                template_name="ayana_morning_greeting",
+                language=language,
+                components=[{
+                    "type": "body",
+                    "parameters": [{"type": "text", "text": nickname}],
+                }],
+            )
+            logger.info(f"WA template sent to open session for {phone}")
+            await asyncio.sleep(1)  # Brief pause before follow-up message
+        except Exception as e:
+            logger.warning(f"Template send failed for {phone}, continuing with regular message: {e}")
+
     # ── 1. Pick variation ──────────────────────────────────────────────────────
     message_en, variation_id = _pick_variation(db, parent_id, tp_type, touchpoint_data)
     message_en = message_en.replace("{nickname}", nickname)
@@ -147,7 +180,22 @@ async def send_touchpoint(parent: dict, touchpoint_data: dict) -> bool:
             translated_text += invite_en
 
     # ── 4. Translate buttons in parallel ───────────────────────────────────────
-    raw_buttons = touchpoint_data.get("button_options", [])
+    raw_buttons = list(touchpoint_data.get("button_options", []))
+
+    # Inject emergency button for mood/greeting touchpoints (WA max 3 buttons)
+    # Cap regular buttons at 2, add emergency as 3rd
+    _EMERGENCY_TOUCHPOINTS = {
+        "morning_greeting", "evening_checkin", "food_check",
+        "activity_check", "anything_else",
+    }
+    if tp_type in _EMERGENCY_TOUCHPOINTS and not any(
+        b.get("action") == "emergency" for b in raw_buttons
+    ):
+        raw_buttons = raw_buttons[:2]  # WA limit: max 3 total
+        raw_buttons.append({
+            "emoji": "🆘", "text_english": "Emergency", "action": "emergency",
+        })
+
     translated_buttons = await _translate_buttons(raw_buttons, language)
 
     # ── 5. Send ────────────────────────────────────────────────────────────────
@@ -193,6 +241,7 @@ async def send_touchpoint(parent: dict, touchpoint_data: dict) -> bool:
             {
                 "current_touchpoint": tp_type,
                 "awaiting_response":  True,
+                "pending_buttons":    translated_buttons,
                 "updated_at":         datetime.utcnow().isoformat(),
             }
         ).eq("parent_id", parent_id).eq("date", today).execute()
@@ -369,6 +418,21 @@ async def start_daily_conversation(parent_id: str) -> bool:
         logger.warning(f"No touchpoints from Gemini for {parent_id} — using fallback")
         touchpoints = _fallback_touchpoints(parent["nickname"], bool(med_groups))
 
+    # ── Sanitize: reject touchpoints with invalid types ────────────────────────
+    _VALID_TOUCHPOINT_TYPES = {
+        "morning_greeting", "food_check", "medicine_before_food",
+        "medicine_after_food", "medicine_night", "activity_check",
+        "evening_checkin", "anything_else", "goodnight",
+        "pain_location", "pain_severity",
+    }
+    touchpoints = [
+        tp for tp in touchpoints
+        if tp.get("touchpoint_type") in _VALID_TOUCHPOINT_TYPES
+    ]
+    if not touchpoints:
+        logger.warning(f"All Gemini touchpoints had invalid types for {parent_id} — using fallback")
+        touchpoints = _fallback_touchpoints(parent["nickname"], bool(med_groups))
+
     # ── Ensure variations exist for each touchpoint type ───────────────────────
     await _ensure_variations_exist(db, parent, touchpoints)
 
@@ -385,6 +449,7 @@ async def start_daily_conversation(parent_id: str) -> bool:
                 "awaiting_response":      False,
                 "touchpoints_completed":  [],
                 "touchpoints_remaining":  remaining,
+                "pending_buttons":        [],
                 "context": {
                     "yesterday":     yesterday_ctx,
                     "health_flows":  [h["condition"] for h in health_flows],
@@ -463,10 +528,32 @@ async def handle_parent_response(parent: dict, msg: dict) -> None:
     # ── Extract content from message ────────────────────────────────────────────
     is_voice   = msg.get("is_voice_note", False)
     raw_body   = (msg.get("button_reply") or msg.get("body") or "").strip()
+
+    # ── Resolve "1" / "2" / "3" to button action (Twilio sandbox workaround) ───
+    # When Twilio renders buttons as numbered text, the parent replies with a
+    # digit. We map it back to the corresponding button action id here so the
+    # rest of the engine never needs to know about sandbox limitations.
+    if raw_body in ("1", "2", "3"):
+        pending = state.get("pending_buttons") or []
+        idx = int(raw_body) - 1
+        if 0 <= idx < len(pending):
+            raw_body = pending[idx].get("id", raw_body)
+            logger.info(f"Resolved number '{msg.get('body')}' → action '{raw_body}'")
+
     action     = raw_body.lower()
     english_text = raw_body
     health_data: dict = {}
     mood: str | None  = None
+
+    # ── Emergency button tap — immediate trigger, no AI needed ────────────────
+    if action in ("emergency", "btn_emergency", "🆘"):
+        from app.services.emergency import trigger_emergency
+        await trigger_emergency(parent_id, {
+            "raw_summary": "Parent pressed the emergency button",
+            "severity": "severe",
+            "trigger": "button",
+        })
+        return
 
     if is_voice and msg.get("media_url"):
         # ── Voice note: full STT → translate → Gemini pipeline ──────────────────
@@ -475,6 +562,17 @@ async def handle_parent_response(parent: dict, msg: dict) -> None:
             if audio_bytes:
                 english_text = await sarvam.parent_voice_to_english(audio_bytes, language) or ""
                 if english_text:
+                    # Fast keyword check on ENGLISH text — fires before Gemini
+                    from app.services.emergency import fast_keyword_check, trigger_emergency
+                    if fast_keyword_check(english_text):
+                        logger.warning(f"CRITICAL keyword detected for {phone}: {english_text[:100]}")
+                        await trigger_emergency(parent_id, {
+                            "raw_summary": english_text[:200],
+                            "severity": "severe",
+                            "trigger": "keyword_detection",
+                        })
+                        # Still run Gemini extraction below for logging
+
                     ctx = {
                         "active_health_flows": state.get("context", {}).get("health_flows", []),
                     }
@@ -553,6 +651,33 @@ async def handle_parent_response(parent: dict, msg: dict) -> None:
     remaining = list(state.get("touchpoints_remaining") or [])
 
     # ── Conversation routing ────────────────────────────────────────────────────
+
+    # Medicine retry/snooze — "Will take soon" schedules a 15-min retry
+    if action in ("medicine_later", "medicine_not_yet", "will_take_soon") and current_tp.startswith("medicine_"):
+        ctx = dict(state.get("context") or {})
+        retry_count = ctx.get("medicine_retry_count", 0)
+        max_retries = 2
+
+        if retry_count < max_retries:
+            retry_at = (datetime.utcnow() + timedelta(minutes=15)).isoformat()
+            ctx["medicine_retry_at"] = retry_at
+            ctx["medicine_retry_count"] = retry_count + 1
+            ctx["medicine_retry_group_id"] = (
+                state.get("context", {}).get("medicine_group_id")
+                or _get_medicine_group_from_tp(db, parent_id, current_tp)
+            )
+            try:
+                db.table("conversation_state").update({"context": ctx}).eq(
+                    "id", state["id"]
+                ).execute()
+            except Exception as e:
+                logger.warning(f"medicine retry context update failed: {e}")
+            logger.info(
+                f"Medicine retry #{retry_count + 1} scheduled for {phone} at {retry_at}"
+            )
+        else:
+            logger.info(f"Medicine max retries reached for {phone}, moving on")
+
     if _is_not_well(action, mood) and current_tp not in ("pain_location", "pain_severity"):
         # Inject pain tree before remaining plan
         remaining = [_PAIN_LOCATION_TP, _PAIN_SEVERITY_TP] + remaining
@@ -1284,3 +1409,31 @@ def _is_button_action(text: str) -> bool:
         "btn_", "voice_",
     )
     return any(text.startswith(p) for p in prefixes)
+
+
+def _get_medicine_group_from_tp(db, parent_id: str, touchpoint_type: str) -> str | None:
+    """Look up the medicine group ID associated with a touchpoint type.
+
+    Maps touchpoint_type (e.g. 'medicine_after_food') back to the
+    anchor_event and finds the matching medicine_group for this parent.
+
+    Returns:
+        UUID string of the medicine group, or None if not found.
+    """
+    tp_to_anchor = {v: k for k, v in _ANCHOR_TO_TP.items()}
+    anchor = tp_to_anchor.get(touchpoint_type)
+    if not anchor:
+        return None
+    try:
+        rows = (
+            db.table("medicine_groups")
+            .select("id")
+            .eq("parent_id", parent_id)
+            .eq("anchor_event", anchor)
+            .limit(1)
+            .execute()
+            .data
+        )
+        return rows[0]["id"] if rows else None
+    except Exception:
+        return None
