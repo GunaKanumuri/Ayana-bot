@@ -183,6 +183,8 @@ async def generate_variations(
 
     desc = touchpoint_descriptions.get(touchpoint, "A caring check-in message.")
 
+    # NOTE: {{nickname}} inside the f-string renders as {nickname} in the prompt text,
+    # which is what we want Gemini to use as a literal placeholder instruction.
     prompt = f"""Generate {count} message variations for a WhatsApp caregiving bot.
 
 The bot speaks AS the child to their elderly parent. It feels like the child themselves is checking in.
@@ -195,23 +197,23 @@ Description: {desc}
 
 VOICE RULES — this is critical:
 - Write like a caring child texting their parent, NOT a health app
-- Use spoken rhythm: short sentences, ellipsis for pauses ("{nickname}... how are you?")
+- Use spoken rhythm: short sentences, ellipsis for pauses ("{{nickname}}... how are you?")
 - Always use the nickname — never say "you" without the name
 - Add warmth: casual, loving, personal
 - Vary daily — never repeat the same opening
 - Under 25 words per message
 - Reference their real life when possible (temple, plants, walk, TV)
-- NEVER clinical: not "How is your health status" but "{nickname}... feeling tired today?"
+- NEVER clinical: not "How is your health status" but "{{nickname}}... feeling tired today?"
 - After fever: "Is the fever better today?" not "How is your fever today?"
 - Morning: some start with "Good morning", some with their name, some with their activity
-- Goodnight: warm, loving — "Rest well {nickname}..."
-- CRITICAL: Write in CLEAN ENGLISH only. No romanized regional words (no "Subhodayam", 
+- Goodnight: warm, loving — "Rest well {{nickname}}..."
+- CRITICAL: Write in CLEAN ENGLISH only. No romanized regional words (no "Subhodayam",
   "baagunnara", "maatra", etc.) — the system translates to the parent's language automatically.
 
-Return ONLY a JSON array of strings. Use {{nickname}} placeholder:
+Return ONLY a JSON array of strings. Use {{{{nickname}}}} placeholder:
 [
-    "Good morning {{nickname}}! Did you sleep well last night?",
-    "{{nickname}}... how are you feeling today? I hope you are doing great!",
+    "Good morning {{{{nickname}}}}! Did you sleep well last night?",
+    "{{{{nickname}}}}... how are you feeling today? I hope you are doing great!",
     ...
 ]"""
 
@@ -248,12 +250,12 @@ Child's name: {child_name}
 Generate today's touchpoints. Return ONLY valid JSON array.
 
 IMPORTANT — message_english must sound like a caring child texting their parent:
-- Use ellipsis for natural pauses: "{nickname}... how are you today?"  
+- Use ellipsis for natural pauses: "{{nickname}}... how are you today?"
 - Short and warm, under 20 words
 - Use {{nickname}} placeholder always
 - Casual phrasing: "Did you have your breakfast?" not "Have you eaten?"
 - Goodnight must mention child name warmly: "Rest well {{nickname}}... {child_name} misses you"
-- CRITICAL: Write in CLEAN ENGLISH only. No romanized regional words (no "Subhodayam", 
+- CRITICAL: Write in CLEAN ENGLISH only. No romanized regional words (no "Subhodayam",
   "baagunnara", "tiffin ayyaka", etc.) — the system translates automatically.
 
 Example touchpoints:
@@ -308,7 +310,6 @@ async def analyze_weekly_patterns(
     parent_nickname: str,
 ) -> dict:
     """Analyze 7-14 days of data for patterns."""
-    # Calculate medicine adherence stats for the prompt
     med_checkins = [c for c in checkins if c.get("touchpoint", "").startswith("medicine_")]
     med_total = len(med_checkins)
     med_taken = sum(
@@ -330,7 +331,7 @@ Return ONLY valid JSON:
 {{
     "summary": "One paragraph summary of the week",
     "mood_trend": "stable | improving | declining",
-    "medicine_adherence_pct": {med_adherence_pct or 'null'},
+    "medicine_adherence_pct": {med_adherence_pct if med_adherence_pct is not None else 'null'},
     "concerns_flagged": ["knee pain mentioned 3 times", "skipped breakfast twice"],
     "recommendations": ["Consider doctor visit for knee pain", "Monitor breakfast habits"],
     "streak_info": "Responded 6 out of 7 days"
@@ -354,22 +355,7 @@ async def generate_daily_observation(
     medicine_status: str,
     response_rate: str,
 ) -> str:
-    """Generate a warm one-line AI observation for a parent's daily report.
-
-    This adds a personal, caring touch to the evening report sent to children.
-    The observation reads like something a caring family member would say.
-
-    Args:
-        parent_nickname: Parent's nickname (e.g. "Amma").
-        mood:            Today's mood ("good", "okay", "not_well", or None).
-        concerns:        List of concerns mentioned today.
-        medicine_status: Medicine status string (e.g. "Morning ✓ Night ✗").
-        response_rate:   Response rate string (e.g. "4/5").
-
-    Returns:
-        A warm one-line observation string. Falls back to a generic
-        message if Gemini is unavailable.
-    """
+    """Generate a warm one-line AI observation for a parent's daily report."""
     prompt = f"""Write ONE warm, caring sentence about an elderly parent's day for their child.
 
 Parent nickname: {parent_nickname}
@@ -389,7 +375,7 @@ Rules:
 - Use {parent_nickname} in the sentence
 
 Examples:
-- "{parent_nickname} had a cheerful day — responded to every check-in with a smile 😊"
+- "{parent_nickname} had a cheerful day — responded to every check-in with a smile"
 - "{parent_nickname} mentioned some knee discomfort but otherwise had a steady day."
 - "{parent_nickname} seems a bit tired today — might be good to give them a call."
 
@@ -397,13 +383,11 @@ Return ONLY the sentence, no quotes, no JSON."""
 
     try:
         result = (await _generate(prompt)).strip().strip('"').strip("'")
-        # Ensure it's not too long
         if len(result) > 150:
             result = result[:147] + "..."
         return result
     except Exception as e:
         logger.warning(f"Daily observation generation failed: {e}")
-        # Warm fallback messages
         if mood == "good":
             return f"{parent_nickname} had a good day today 😊"
         elif mood == "not_well":
