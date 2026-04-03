@@ -64,7 +64,7 @@ _DEFAULT_VOICE: dict[str, str] = {
     "mr": "sumedha",
     "gu": "nandita",
     "pa": "suresh",
-    "en": "anushka",
+    "en": "amelia",
 }
 
 # ─── Anchor event → default time ─────────────────────────────────────────────

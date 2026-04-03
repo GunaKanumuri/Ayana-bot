@@ -4,7 +4,7 @@ Sarvam handles language. Gemini handles understanding.
 All Gemini calls return structured JSON.
 
 Uses google-genai SDK (google-genai package, NOT google-generativeai).
-Model: gemini-2.0-flash
+model="gemini-2.5-flash-preview-04-17",
 """
 
 import asyncio
@@ -30,7 +30,7 @@ def _generate_sync(prompt: str) -> str:
     """Synchronous Gemini call — returns response text."""
     client = _get_client()
     response = client.models.generate_content(
-        model="gemini-2.0-flash",
+       model="gemini-2.5-flash-preview-04-17",
         contents=prompt,
     )
     return response.text
