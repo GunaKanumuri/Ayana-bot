@@ -53,7 +53,7 @@ _scheduler: BackgroundScheduler | None = None
 _daily_reports_sent:  dict[str, str] = {}
 _weekly_reports_sent: dict[str, str] = {}
 
-_IST = ZoneInfo(settings.TIMEZONE)
+_IST        = ZoneInfo(settings.TIMEZONE)
 _WINDOW_MINS = 4
 
 
@@ -129,6 +129,10 @@ async def _async_main_loop() -> None:
 async def _check_morning_greetings(hhmm: str, today: str) -> None:
     """Start daily conversation for every parent whose checkin_time is now.
 
+    Loads the FULL parent row (select *) so start_daily_conversation receives
+    all profile fields: bio, tone, routine, activities, conditions, etc.
+    Without the full row, Gemini gets an empty profile and plans a 2-touchpoint day.
+
     Before starting the conversation, advances any active health flows by one
     day so the greeting reflects the parent's current recovery state.
     """
@@ -137,9 +141,13 @@ async def _check_morning_greetings(hhmm: str, today: str) -> None:
 
     db = get_db()
     try:
+        # CRITICAL: select("*") — not a partial select.
+        # start_daily_conversation uses parent["bio"], parent["tone"],
+        # parent["routine"], parent["activities"], parent["conditions"] etc.
+        # A partial select causes silent KeyErrors / empty profile → Gemini fallback.
         parents = (
             db.table("parents")
-            .select("id, phone, nickname, checkin_time, is_active, paused_until")
+            .select("*")
             .eq("is_active", True)
             .execute()
             .data or []
@@ -216,14 +224,14 @@ async def _check_medicine_reminders(hhmm: str, today: str) -> None:
         return
 
     anchor_to_tp = {
-        "wake":        "medicine_before_food",
-        "before_food": "medicine_before_food",
-        "after_food":  "medicine_after_food",
-        "afternoon":   "medicine_after_food",
-        "evening":     "medicine_after_food",
-        "dinner":      "medicine_after_food",
-        "after_dinner":"medicine_night",
-        "night":       "medicine_night",
+        "wake":         "medicine_before_food",
+        "before_food":  "medicine_before_food",
+        "after_food":   "medicine_after_food",
+        "afternoon":    "medicine_after_food",
+        "evening":      "medicine_after_food",
+        "dinner":       "medicine_after_food",
+        "after_dinner": "medicine_night",
+        "night":        "medicine_night",
     }
 
     for grp in groups:
@@ -273,19 +281,14 @@ async def _check_medicine_reminders(hhmm: str, today: str) -> None:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# CHECK 3 — MEDICINE RETRIES (picks up "will take soon" / "remind later")
+# CHECK 3 — MEDICINE RETRIES
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_medicine_retries(today: str) -> None:
-    """Re-send medicine reminders when parent said 'will take soon'.
-
-    conversation.py writes medicine_retry_at into conversation_state.context.
-    This function checks if the retry time has passed and the medicine
-    touchpoint still has status=replied with action=medicine_later.
-    """
+    """Re-send medicine reminders when parent said 'will take soon'."""
     from app.services.conversation import send_medicine_reminder
 
-    db = get_db()
+    db      = get_db()
     now_utc = datetime.utcnow().isoformat()
 
     try:
@@ -301,27 +304,31 @@ async def _check_medicine_retries(today: str) -> None:
         return
 
     for state in states:
-        ctx = state.get("context") or {}
+        ctx      = state.get("context") or {}
         retry_at = ctx.get("medicine_retry_at")
         if not retry_at or retry_at > now_utc:
             continue
 
-        parent_id = state["parent_id"]
-        group_id  = ctx.get("medicine_retry_group_id")
+        parent_id   = state["parent_id"]
+        group_id    = ctx.get("medicine_retry_group_id")
         retry_count = ctx.get("medicine_retry_count", 0)
 
         try:
-            # Check if medicine was taken since the retry was scheduled
-            med_checkins = (
+            # NOTE: Supabase Python client doesn't support .like() reliably.
+            # Fetch all today's replied check_ins and filter in Python.
+            all_checkins = (
                 db.table("check_ins")
-                .select("medicine_taken")
+                .select("touchpoint, medicine_taken")
                 .eq("parent_id", parent_id)
                 .eq("date", today)
-                .like("touchpoint", "medicine_%")
                 .eq("status", "replied")
                 .execute()
                 .data or []
             )
+            med_checkins = [
+                c for c in all_checkins
+                if c.get("touchpoint", "").startswith("medicine_")
+            ]
             already_taken = any(
                 isinstance(c.get("medicine_taken"), dict) and c["medicine_taken"].get("taken")
                 for c in med_checkins
@@ -330,12 +337,9 @@ async def _check_medicine_retries(today: str) -> None:
                 ctx.pop("medicine_retry_at", None)
                 ctx.pop("medicine_retry_count", None)
                 ctx.pop("medicine_retry_group_id", None)
-                db.table("conversation_state").update({"context": ctx}).eq(
-                    "id", state["id"]
-                ).execute()
+                db.table("conversation_state").update({"context": ctx}).eq("id", state["id"]).execute()
                 continue
 
-            # Load parent and medicine group for re-send
             parent_rows = (
                 db.table("parents")
                 .select("id, phone, nickname, language, tts_voice, is_active, family_id")
@@ -357,22 +361,14 @@ async def _check_medicine_retries(today: str) -> None:
                     .data
                 )
                 if grp_rows:
-                    logger.info(
-                        f"[scheduler] Medicine retry #{retry_count} for {parent['phone']}"
-                    )
+                    logger.info(f"[scheduler] Medicine retry #{retry_count} for {parent['phone']}")
                     await send_medicine_reminder(parent, grp_rows[0])
 
-            # Clear the retry flag (max 2 retries enforced by conversation.py)
             ctx.pop("medicine_retry_at", None)
-            db.table("conversation_state").update({"context": ctx}).eq(
-                "id", state["id"]
-            ).execute()
+            db.table("conversation_state").update({"context": ctx}).eq("id", state["id"]).execute()
 
         except Exception as e:
-            logger.error(
-                f"[scheduler] Medicine retry failed for parent {parent_id}: {e}",
-                exc_info=True,
-            )
+            logger.error(f"[scheduler] Medicine retry failed for parent {parent_id}: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -383,7 +379,7 @@ async def _check_nudges(today: str) -> None:
     """Send a single follow-up nudge 3 hours after an unanswered morning greeting."""
     from app.services.conversation import send_nudge
 
-    db = get_db()
+    db     = get_db()
     cutoff = (datetime.utcnow() - timedelta(hours=3)).isoformat()
 
     try:
@@ -435,9 +431,7 @@ async def _check_nudges(today: str) -> None:
             ).execute()
 
         except Exception as e:
-            logger.error(
-                f"[scheduler] Nudge failed for parent {parent_id}: {e}", exc_info=True
-            )
+            logger.error(f"[scheduler] Nudge failed for parent {parent_id}: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -445,18 +439,10 @@ async def _check_nudges(today: str) -> None:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_missed_checkins(today: str) -> None:
-    """Mark morning check-ins as 'missed' after 6 h — then send a silence flag.
-
-    Silence flag is a distinct AMBER-TONE alert (NOT an emergency):
-    child gets a WhatsApp message with two reply options:
-      Reply 1 → I'll call them now
-      Reply 2 → She's fine, I know
-
-    No auto-call, no escalation. Just a heads-up.
-    """
+    """Mark morning check-ins as 'missed' after 6 h — then send a silence flag."""
     from app.services.emergency import send_silence_flag
 
-    db = get_db()
+    db     = get_db()
     cutoff = (datetime.utcnow() - timedelta(hours=6)).isoformat()
 
     try:
@@ -476,16 +462,11 @@ async def _check_missed_checkins(today: str) -> None:
     for ci in stale:
         parent_id = ci["parent_id"]
         try:
-            # Mark the check_in row as missed
-            db.table("check_ins").update({"status": "missed"}).eq(
-                "id", ci["id"]
-            ).execute()
+            db.table("check_ins").update({"status": "missed"}).eq("id", ci["id"]).execute()
 
-            # Only send the silence flag once — on the morning_greeting touchpoint
             if ci["touchpoint"] != "morning_greeting":
                 continue
 
-            # Load parent to get family_id and nickname
             parent_rows = (
                 db.table("parents")
                 .select("nickname, family_id")
@@ -499,9 +480,7 @@ async def _check_missed_checkins(today: str) -> None:
             family_id = parent_rows[0]["family_id"]
             nickname  = parent_rows[0]["nickname"]
 
-            logger.warning(
-                f"[scheduler] Sending silence flag for {nickname} (parent {parent_id})"
-            )
+            logger.warning(f"[scheduler] Sending silence flag for {nickname} (parent {parent_id})")
             await send_silence_flag(family_id, parent_id)
 
         except Exception as e:
@@ -551,10 +530,7 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
                 await generate_daily_report(family_id)
                 _daily_reports_sent[family_id] = today
             except Exception as e:
-                logger.error(
-                    f"[scheduler] Daily report failed for family {family_id}: {e}",
-                    exc_info=True,
-                )
+                logger.error(f"[scheduler] Daily report failed for family {family_id}: {e}", exc_info=True)
 
         if is_sunday and _weekly_reports_sent.get(family_id) != today:
             try:
@@ -562,10 +538,7 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
                 await generate_weekly_report(family_id)
                 _weekly_reports_sent[family_id] = today
             except Exception as e:
-                logger.error(
-                    f"[scheduler] Weekly report failed for family {family_id}: {e}",
-                    exc_info=True,
-                )
+                logger.error(f"[scheduler] Weekly report failed for family {family_id}: {e}", exc_info=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -573,11 +546,7 @@ async def _check_evening_reports(hhmm: str, today: str, is_sunday: bool) -> None
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def _check_letter_deliveries(today: str) -> None:
-    """Deliver any pending letters/notes whose deliver_date is today.
-
-    Marks each letter as delivered (or failed) after processing so it
-    never fires twice.
-    """
+    """Deliver any pending letters/notes whose deliver_date is today."""
     from app.services import sarvam, whatsapp
 
     db = get_db()
@@ -595,7 +564,6 @@ async def _check_letter_deliveries(today: str) -> None:
             .data or []
         )
     except Exception as e:
-        # Table may not exist yet — fail silently
         if "letters" not in str(e).lower():
             logger.error(f"[scheduler] letters fetch failed: {e}")
         return
@@ -612,40 +580,25 @@ async def _check_letter_deliveries(today: str) -> None:
 
             try:
                 audio_url, translated = await sarvam.english_to_parent_audio(
-                    msg_en,
-                    parent["language"],
-                    parent["tts_voice"],
-                    parent["nickname"],
+                    msg_en, parent["language"], parent["tts_voice"], parent["nickname"],
                 )
                 await whatsapp.send_audio_and_buttons(
-                    to=parent["phone"],
-                    audio_url=audio_url or "",
-                    text=translated or msg_en,
+                    to=parent["phone"], audio_url=audio_url or "", text=translated or msg_en,
                 )
             except Exception as send_err:
-                logger.warning(
-                    f"[scheduler] Letter audio failed, falling back to text: {send_err}"
-                )
+                logger.warning(f"[scheduler] Letter audio failed, falling back to text: {send_err}")
                 await whatsapp.send_message(parent["phone"], msg_en)
 
             db.table("letters").update(
-                {
-                    "status":       "delivered",
-                    "delivered_at": datetime.utcnow().isoformat(),
-                }
+                {"status": "delivered", "delivered_at": datetime.utcnow().isoformat()}
             ).eq("id", letter["id"]).execute()
 
             logger.info(f"[scheduler] Letter delivered to {parent['phone']}")
 
         except Exception as e:
-            logger.error(
-                f"[scheduler] Letter delivery failed for {letter.get('id')}: {e}",
-                exc_info=True,
-            )
+            logger.error(f"[scheduler] Letter delivery failed for {letter.get('id')}: {e}", exc_info=True)
             try:
-                db.table("letters").update({"status": "failed"}).eq(
-                    "id", letter["id"]
-                ).execute()
+                db.table("letters").update({"status": "failed"}).eq("id", letter["id"]).execute()
             except Exception:
                 pass
 

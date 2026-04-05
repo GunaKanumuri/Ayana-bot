@@ -53,10 +53,10 @@ class CheckInResponse(BaseModel):
 # ═══════════════ Health Extraction (Gemini output) ═══════════════
 
 class HealthExtraction(BaseModel):
-    mood: Optional[str] = None  # good, okay, not_well
+    mood: Optional[str] = None          # good, okay, not_well
     concerns: list[str] = []
     medicine_mentioned: bool = False
-    severity: Optional[str] = None  # mild, moderate, severe
+    severity: Optional[str] = None      # mild, moderate, severe
     urgency_flag: bool = False
     follow_up_needed: bool = False
     food_eaten: Optional[bool] = None
@@ -67,20 +67,21 @@ class HealthExtraction(BaseModel):
 
 class RoutineExtraction(BaseModel):
     wake_time: Optional[str] = None
-    medicines: list[dict] = []  # [{name, display_name, timing, instructions}]
+    medicines: list[dict] = []          # [{name, display_name, timing, instructions, time_estimate}]
     activities: list[str] = []
     conditions: list[str] = []
     alone_during_day: bool = False
+    meal_times: dict = {}               # {tea, tiffin/breakfast, lunch, dinner} from Gemini
     notes: str = ""
 
 
 # ═══════════════ Conversation Touchpoint ═══════════════
 
 class Touchpoint(BaseModel):
-    touchpoint_type: str  # morning_greeting, food_check, etc.
+    touchpoint_type: str                # morning_greeting, food_check, etc.
     time_slot: time
     message_english: str
-    button_options: list[dict]  # [{emoji, text_english, action}]
+    button_options: list[dict]          # [{emoji, text_english, action}]
     include_voice_invite: bool = False
     is_health_flow: bool = False
     health_flow_id: Optional[str] = None

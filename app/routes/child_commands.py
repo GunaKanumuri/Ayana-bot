@@ -64,7 +64,7 @@ _DEFAULT_VOICE: dict[str, str] = {
     "mr": "sumedha",
     "gu": "nandita",
     "pa": "suresh",
-    "en": "amelia",
+    "en": "anushka",
 }
 
 # ─── Anchor event → default time ─────────────────────────────────────────────
@@ -120,6 +120,7 @@ COMMAND_MENU = """\
 ➕ *add parent*           — Register a new parent
 👥 *add +91XXXXXXXXXX*   — Add a sibling / co-caregiver
 ⚙️  *settings*             — View your current settings
+🖥️ *dashboard*            — Get link to your family health dashboard
 📖 *menu*                 — Show this list
 
 _Example: ask Amma did you take your BP tablet?_\
@@ -190,6 +191,18 @@ async def handle_child_message(child: dict, msg: dict) -> None:
 
     elif text == "settings":
         await _cmd_settings(child)
+
+    elif text in ("1", "i'll call them now", "calling now", "calling_now"):
+        # Child replied to a silence flag or emergency alert
+        await _cmd_emergency_reply(child, "calling_now")
+
+    elif text in ("2", "resolved", "she's fine", "they're fine", "fine", "ok"):
+        # Child acknowledged an alert as resolved
+        await _cmd_emergency_reply(child, "resolved")
+
+    elif text == "dashboard" or text == "report link":
+        # Child wants the web dashboard link
+        await _cmd_dashboard_link(child)
 
     else:
         await send_message(
@@ -357,6 +370,14 @@ async def _cmd_report(child: dict, body: str) -> None:
 
             report_parts.append("\n".join(block))
 
+        # Append dashboard link at the end
+        try:
+            from app.utils.token import make_report_url
+            dash_url = make_report_url(family_id)
+            report_parts.append(f"📊 _Full dashboard: {dash_url}_")
+        except Exception:
+            pass  # Non-critical
+
         await send_message(phone, "\n\n".join(report_parts))
 
     except Exception as e:
@@ -486,6 +507,44 @@ async def _cmd_settings(child: dict) -> None:
 
     lines.append("\nTo change settings, contact your AYANA admin.")
     await send_message(phone, "\n".join(lines))
+
+
+async def _cmd_emergency_reply(child: dict, action: str) -> None:
+    """Handle child reply to an emergency or silence alert (1 = calling / 2 = resolved).
+
+    Delegates to emergency.handle_child_emergency_reply which finds the
+    latest unacknowledged alert for this child's family.
+    """
+    try:
+        from app.services.emergency import handle_child_emergency_reply
+        await handle_child_emergency_reply(child["phone"], action)
+    except Exception as e:
+        logger.error(f"Emergency reply handling failed for {child['phone']}: {e}", exc_info=True)
+
+
+async def _cmd_dashboard_link(child: dict) -> None:
+    """Send the child a link to the web dashboard for their family."""
+    from app.db import get_db
+    phone     = child["phone"]
+    family_id = child.get("family_id")
+
+    if not family_id:
+        await send_message(phone, "No family set up yet. Send *add parent* to get started.")
+        return
+
+    try:
+        from app.utils.token import make_report_url
+        url = make_report_url(family_id)
+        await send_message(
+            phone,
+            f"📊 *Your AYANA Dashboard*\n\n"
+            f"View the last 7 days of health data for your family:\n"
+            f"{url}\n\n"
+            f"_Link valid for 7 days._",
+        )
+    except Exception as e:
+        logger.error(f"Dashboard link failed for {phone}: {e}")
+        await send_message(phone, "Could not generate dashboard link. Please try again.")
 
 
 async def _cmd_add_sibling(child: dict, raw_phone: str) -> None:

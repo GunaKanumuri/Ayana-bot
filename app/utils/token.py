@@ -4,10 +4,13 @@ Tokens are base64url-encoded JSON payloads embedded in daily report links.
 No cryptographic signing — security comes from the 7-day expiry and the fact
 that family_id is a UUID (guessing one is effectively impossible).
 
+The link points to the Next.js dashboard (DASHBOARD_URL), not the FastAPI
+backend (APP_URL). Make sure to set DASHBOARD_URL in your Railway env vars.
+
 Usage:
     from app.utils.token import make_report_token, make_report_url
-    url = make_report_url(family_id, date_str)
-    # → https://ayana.app/report/eyJmYW1pbHlfaWQiOiJ...
+    url = make_report_url(family_id)
+    # → https://your-dashboard.vercel.app/report/eyJmYW1pbHlfaWQiOiJ...
 """
 
 import base64
@@ -22,7 +25,7 @@ def make_report_token(family_id: str, report_date: str | None = None) -> str:
 
     Args:
         family_id:   UUID of the family.
-        report_date: ISO date string (default: today in IST).
+        report_date: ISO date string (default: today).
 
     Returns:
         URL-safe base64 string (no padding).
@@ -33,6 +36,7 @@ def make_report_token(family_id: str, report_date: str | None = None) -> str:
     payload = {
         "family_id": family_id,
         "date":      report_date,
+        # expires in milliseconds (matches JS Date.now() in the dashboard)
         "expires":   int((datetime.utcnow() + timedelta(days=7)).timestamp() * 1000),
     }
     raw = json.dumps(payload, separators=(",", ":")).encode()
@@ -42,13 +46,15 @@ def make_report_token(family_id: str, report_date: str | None = None) -> str:
 def make_report_url(family_id: str, report_date: str | None = None) -> str:
     """Return the full dashboard URL for embedding in WhatsApp reports.
 
+    Uses DASHBOARD_URL (Vercel) — not APP_URL (Railway backend).
+
     Args:
         family_id:   UUID of the family.
         report_date: ISO date string (default: today).
 
     Returns:
-        Full URL string, e.g. https://ayana.app/report/eyJ...
+        Full URL, e.g. https://ayana-dashboard.vercel.app/report/eyJ...
     """
     token = make_report_token(family_id, report_date)
-    base  = settings.APP_URL.rstrip("/")
+    base  = settings.DASHBOARD_URL.rstrip("/")
     return f"{base}/report/{token}"

@@ -1009,6 +1009,7 @@ async def _ensure_variations_exist(
             continue
 
         try:
+            # Layer 1: parent-specific variations already exist — skip
             existing = (
                 db.table("message_variations")
                 .select("id")
@@ -1018,6 +1019,29 @@ async def _ensure_variations_exist(
                 .data
             )
             if existing:
+                continue
+
+            # Layer 2: global seeds already cover this touchpoint — skip Gemini,
+            # only generate personalised variations if bio/activities are rich.
+            global_seeds = (
+                db.table("message_variations")
+                .select("id")
+                .is_("parent_id", "null")
+                .eq("touchpoint", tp_type)
+                .execute()
+                .data
+            )
+            has_rich_profile = bool(
+                parent.get("bio") or
+                parent.get("activities") or
+                parent.get("conditions")
+            )
+            if global_seeds and not has_rich_profile:
+                # Global seeds exist and nothing to personalise — skip Gemini call
+                logger.debug(
+                    f"Skipping variation generation for {tp_type} — "
+                    f"global seeds exist and parent has no personalisation data"
+                )
                 continue
 
             # Generate variations

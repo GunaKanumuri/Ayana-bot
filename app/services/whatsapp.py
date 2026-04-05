@@ -203,7 +203,8 @@ async def extract_meta_message(payload: dict) -> dict | None:
             if media_id:
                 result["media_url"] = await _meta_download_media(media_id)
                 result["media_type"] = audio.get("mime_type", "audio/ogg")
-                result["is_voice_note"] = audio.get("voice", False)
+                # True if Meta marks it as voice, OR if mime_type is audio (covers all recorded audio)
+                result["is_voice_note"] = audio.get("voice", False) or "audio" in audio.get("mime_type", "")
         
         return result
     except Exception as e:

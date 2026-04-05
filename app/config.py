@@ -40,8 +40,15 @@ class Settings:
     # Gemini
     GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "")
 
-    # App
+    # App — backend API URL (Railway)
     APP_URL: str = os.getenv("APP_URL", "http://localhost:8000")
+
+    # Dashboard — Next.js frontend URL (Vercel)
+    # Used to build report links embedded in WhatsApp messages.
+    # If not set, falls back to APP_URL (works in local dev).
+    # Production: set to https://your-dashboard.vercel.app
+    DASHBOARD_URL: str = os.getenv("DASHBOARD_URL", "") or os.getenv("APP_URL", "http://localhost:3000")
+
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "changethis")
     TIMEZONE: str = os.getenv("TIMEZONE", "Asia/Kolkata")
 

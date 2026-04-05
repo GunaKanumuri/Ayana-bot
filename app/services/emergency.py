@@ -104,22 +104,20 @@ async def trigger_emergency(parent_id: str, context: dict) -> None:
         logger.error("trigger_emergency: parent %s not found", parent_id)
         return
 
-    family_id   = parent.get("family_id")
-    nickname    = parent.get("nickname", "your parent")
-    language    = parent.get("language", "te")
-    voice       = parent.get("tts_voice", "roopa")
+    family_id    = parent.get("family_id")
+    nickname     = parent.get("nickname", "your parent")
+    language     = parent.get("language", "te")
+    voice        = parent.get("tts_voice", "roopa")
     parent_phone = parent.get("phone", "")
-    city        = (parent.get("routine") or {}).get("city", "")
+    city         = (parent.get("routine") or {}).get("city", "")
 
     children    = _load_children(db, family_id)
     primary     = next((c for c in children if c.get("is_primary")), None) or (children[0] if children else None)
     raw_summary = context.get("raw_summary", "distress signal")
-    trigger     = context.get("trigger_type", "ai_detected")
 
-    # Persist alert record
     alert_id = _persist_alert(db, family_id, parent_id, nickname, raw_summary, context)
 
-    # ── Step 0: immediate — Tell parent help is coming + WA alert to children ─
+    # ── Step 0: immediate ─────────────────────────────────────────────────────
     await asyncio.gather(
         _confirm_with_parent(parent_phone, nickname, language, voice),
         _alert_children_whatsapp(children, nickname, raw_summary, context, alert_id),
@@ -184,7 +182,9 @@ async def send_silence_flag(family_id: str, parent_id: str) -> None:
     """Send an amber warning to children when parent hasn't checked in.
 
     This is NOT an emergency. No auto-call. No escalation.
-    Just a warm WhatsApp with buttons: 📞 I'll call / ✅ She's fine.
+    Just a warm WhatsApp with buttons: 📞 I'll call / ✅ They're fine.
+
+    Uses gender-neutral language — "They're fine" not "She's fine".
 
     Args:
         family_id: UUID of the family.
@@ -225,7 +225,7 @@ async def send_silence_flag(family_id: str, parent_id: str) -> None:
             f"This could just mean they're busy.\n\n"
             f"_You may want to give them a quick call._\n\n"
             f"Reply *1* — I'll call them now\n"
-            f"Reply *2* — She's fine, I know"
+            f"Reply *2* — They're fine, I know"    # ← gender-neutral
         )
 
         for child in children:
@@ -245,15 +245,12 @@ async def handle_child_emergency_reply(child_phone: str, action: str) -> None:
     """Handle a child's button reply to an emergency alert.
 
     action: "calling_now" | "resolved"
-
-    Finds the latest unacknowledged alert for this child's family.
     """
     from app.services.whatsapp import send_message
 
     db = get_db()
 
     try:
-        # Find child's family
         child_rows = (
             db.table("children")
             .select("family_id, name")
@@ -267,7 +264,6 @@ async def handle_child_emergency_reply(child_phone: str, action: str) -> None:
         family_id  = child_rows[0]["family_id"]
         child_name = child_rows[0]["name"]
 
-        # Latest unacknowledged alert
         alerts = (
             db.table("alerts")
             .select("id, parent_id")
@@ -293,7 +289,6 @@ async def handle_child_emergency_reply(child_phone: str, action: str) -> None:
             logger.info("Alert %s acknowledged as resolved by %s", alert["id"], child_phone)
 
         elif action == "calling_now":
-            # Log that they're calling but don't mark resolved yet
             logger.info("Alert %s: %s (%s) said they're calling", alert["id"], child_name, child_phone)
             await send_message(
                 child_phone,
@@ -309,24 +304,16 @@ async def handle_child_emergency_reply(child_phone: str, action: str) -> None:
 # PRIVATE: ESCALATION STEPS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-async def _confirm_with_parent(
-    phone: str, nickname: str, language: str, voice: str
-) -> None:
-    """Tell parent in their language that help is on the way."""
+async def _confirm_with_parent(phone: str, nickname: str, language: str, voice: str) -> None:
     from app.services import sarvam, whatsapp
-
     msg_en = (
         f"{nickname}, I am alerting your family right now. "
         f"Please stay calm. Help is on its way. "
         f"Don't move around — your family will contact you very soon."
     )
     try:
-        audio_url, translated = await sarvam.english_to_parent_audio(
-            msg_en, language, voice, nickname
-        )
-        await whatsapp.send_audio_and_buttons(
-            to=phone, audio_url=audio_url or "", text=translated or msg_en
-        )
+        audio_url, translated = await sarvam.english_to_parent_audio(msg_en, language, voice, nickname)
+        await whatsapp.send_audio_and_buttons(to=phone, audio_url=audio_url or "", text=translated or msg_en)
         logger.info("Emergency confirmation sent to parent %s", phone)
     except Exception as e:
         logger.error("Emergency parent confirmation failed for %s: %s", phone, e)
@@ -339,12 +326,9 @@ async def _alert_children_whatsapp(
     context: dict,
     alert_id: str | None = None,
 ) -> None:
-    """Send urgent WhatsApp alert to all children with action buttons."""
     from app.services.whatsapp import send_message
-
     severity = context.get("severity", "severe")
     concerns = ", ".join(context.get("concerns", [])) or raw_summary
-
     message = (
         f"🚨 *AYANA EMERGENCY — {nickname}*\n\n"
         f"*{nickname}* may need immediate help.\n\n"
@@ -355,10 +339,8 @@ async def _alert_children_whatsapp(
         f"Reply *1* — I'm calling them now\n"
         f"Reply *2* — Resolved, I've reached them"
     )
-
-    tasks = [send_message(child["phone"], message) for child in children]
+    tasks   = [send_message(child["phone"], message) for child in children]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
     for child, result in zip(children, results):
         if isinstance(result, Exception):
             logger.error("Emergency WA alert failed to %s: %s", child["phone"], result)
@@ -366,12 +348,8 @@ async def _alert_children_whatsapp(
             logger.info("Emergency WA alert sent to %s", child["phone"])
 
 
-async def _alert_backup_contact(
-    backup_phone: str, parent_nickname: str, child_name: str
-) -> None:
-    """WhatsApp the backup contact if children haven't responded."""
+async def _alert_backup_contact(backup_phone: str, parent_nickname: str, child_name: str) -> None:
     from app.services.whatsapp import send_message
-
     message = (
         f"This is *AYANA*, a care companion service.\n\n"
         f"*{parent_nickname}* pressed the emergency button. "
@@ -386,42 +364,26 @@ async def _alert_backup_contact(
 
 
 async def _make_voice_call(to_phone: str, parent_nickname: str) -> bool:
-    """Place a Twilio Voice call with TwiML message. Returns True if initiated."""
     if not settings.TWILIO_VOICE_PHONE:
         logger.warning("TWILIO_VOICE_PHONE not set — skipping voice call to %s", to_phone)
         return False
-
     try:
         from twilio.rest import Client as TwilioClient
-
         client = TwilioClient(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-        twiml = _TWIML_TEMPLATE.format(nickname=parent_nickname)
-
-        call = client.calls.create(
-            to=to_phone,
-            from_=settings.TWILIO_VOICE_PHONE,
-            twiml=twiml,
-        )
+        twiml  = _TWIML_TEMPLATE.format(nickname=parent_nickname)
+        call   = client.calls.create(to=to_phone, from_=settings.TWILIO_VOICE_PHONE, twiml=twiml)
         logger.info("Voice call initiated to %s — SID %s", to_phone, call.sid)
         return True
-
     except Exception as e:
         logger.error("Voice call to %s failed: %s", to_phone, e)
         return False
 
 
 async def _is_acknowledged(db, alert_id: str | None) -> bool:
-    """Check if an alert has been acknowledged — stops escalation chain."""
     if not alert_id:
         return False
     try:
-        rows = (
-            db.table("alerts")
-            .select("acknowledged")
-            .eq("id", alert_id)
-            .execute()
-            .data
-        )
+        rows = db.table("alerts").select("acknowledged").eq("id", alert_id).execute().data
         return bool(rows and rows[0].get("acknowledged"))
     except Exception:
         return False
@@ -431,15 +393,7 @@ async def _is_acknowledged(db, alert_id: str | None) -> bool:
 # PRIVATE: DB HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _persist_alert(
-    db,
-    family_id: str | None,
-    parent_id: str,
-    nickname: str,
-    raw_summary: str,
-    context: dict,
-) -> str | None:
-    """Insert an emergency alert row and return its UUID."""
+def _persist_alert(db, family_id: str | None, parent_id: str, nickname: str, raw_summary: str, context: dict) -> str | None:
     if not family_id:
         return None
     try:

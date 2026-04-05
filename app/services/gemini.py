@@ -4,7 +4,7 @@ Sarvam handles language. Gemini handles understanding.
 All Gemini calls return structured JSON.
 
 Uses google-genai SDK (google-genai package, NOT google-generativeai).
-model="gemini-2.5-flash-preview-04-17",
+Model: gemini-2.0-flash
 """
 
 import asyncio
@@ -28,9 +28,9 @@ def _get_client() -> genai.Client:
 
 def _generate_sync(prompt: str) -> str:
     """Synchronous Gemini call — returns response text."""
-    client = _get_client()
+    client   = _get_client()
     response = client.models.generate_content(
-       model="gemini-2.5-flash-preview-04-17",
+        model="gemini-2.0-flash",
         contents=prompt,
     )
     return response.text
@@ -99,6 +99,7 @@ Rules:
 - display_name should be simple, colloquial — "BP tablet" not "Telmisartan 40mg"
 - If specific times aren't mentioned, estimate based on typical Indian household routine
 - alone_during_day = true if the child mentions parent is alone, lives alone, etc.
+- Always populate meal_times even if estimating — it's used for conversation scheduling
 
 Respond ONLY with JSON. No explanation."""
 
@@ -168,29 +169,36 @@ async def generate_variations(
     """Generate message variations for a touchpoint."""
     activities = parent_profile.get("activities", [])
     conditions = parent_profile.get("conditions", [])
+    bio        = parent_profile.get("bio", "")
+    tone       = parent_profile.get("tone", "warm")
 
     touchpoint_descriptions = {
-        "morning_greeting": "Morning greeting asking how they are. Warm, like a child greeting their parent.",
-        "food_check": "Asking if they ate their meal (tiffin/lunch/dinner). Casual, caring.",
-        "medicine_before_food": "Reminding about medicine before food. Gentle, not nagging.",
+        "morning_greeting":    "Morning greeting asking how they are. Warm, like a child greeting their parent.",
+        "food_check":          "Asking if they ate their meal (tiffin/lunch/dinner). Casual, caring.",
+        "medicine_before_food":"Reminding about medicine before food. Gentle, not nagging.",
         "medicine_after_food": "Asking if they took medicine after food. Simple confirmation.",
-        "medicine_night": "Night medicine check. Brief, combined with dinner check.",
-        "activity_check": f"Asking about their daily activities: {', '.join(activities)}. Interested, personal.",
-        "evening_checkin": "Evening check — how was your day. Open-ended but with button options.",
-        "anything_else": "Final question — anything else to share? Invites voice message.",
-        "goodnight": "Sweet good night message. Uses child's warmth. Short, loving.",
+        "medicine_night":      "Night medicine check. Brief, combined with dinner check.",
+        "activity_check":      f"Asking about their daily activities: {', '.join(activities)}. Interested, personal.",
+        "evening_checkin":     "Evening check — how was your day. Open-ended but with button options.",
+        "anything_else":       "Final question — anything else to share? Invites voice message.",
+        "goodnight":           "Sweet good night message. Uses child's warmth. Short, loving.",
     }
 
-    desc = touchpoint_descriptions.get(touchpoint, "A caring check-in message.")
+    desc      = touchpoint_descriptions.get(touchpoint, "A caring check-in message.")
+    tone_desc = {
+        "warm":     "affectionate, like a loving child",
+        "cheerful": "upbeat and light-hearted",
+        "calm":     "gentle and soothing",
+    }.get(tone, "warm and caring")
 
-    # NOTE: {{nickname}} inside the f-string renders as {nickname} in the prompt text,
-    # which is what we want Gemini to use as a literal placeholder instruction.
     prompt = f"""Generate {count} message variations for a WhatsApp caregiving bot.
 
 The bot speaks AS the child to their elderly parent. It feels like the child themselves is checking in.
 Parent's nickname: "{parent_nickname}"
 Activities: {', '.join(activities) if activities else 'general household'}
 Conditions: {', '.join(conditions) if conditions else 'none known'}
+Bio: {bio if bio else 'no additional info'}
+Tone: {tone_desc}
 
 Touchpoint: {touchpoint}
 Description: {desc}
@@ -199,10 +207,10 @@ VOICE RULES — this is critical:
 - Write like a caring child texting their parent, NOT a health app
 - Use spoken rhythm: short sentences, ellipsis for pauses ("{{nickname}}... how are you?")
 - Always use the nickname — never say "you" without the name
-- Add warmth: casual, loving, personal
+- Add warmth: casual, loving, personal — match the tone: {tone_desc}
 - Vary daily — never repeat the same opening
 - Under 25 words per message
-- Reference their real life when possible (temple, plants, walk, TV)
+- Reference their real life when possible (temple, plants, walk, TV, their conditions/activities)
 - NEVER clinical: not "How is your health status" but "{{nickname}}... feeling tired today?"
 - After fever: "Is the fever better today?" not "How is your fever today?"
 - Morning: some start with "Good morning", some with their name, some with their activity
@@ -224,7 +232,7 @@ Return ONLY a JSON array of strings. Use {{{{nickname}}}} placeholder:
         return []
     except Exception as e:
         logger.error(f"Variation generation failed: {e}")
-        return [f"Good morning {{nickname}}! How are you today?"]
+        return ["Good morning {nickname}! How are you today?"]
 
 
 # ═══════════════ DAILY CONVERSATION PLANNER ═══════════════
@@ -237,32 +245,91 @@ async def plan_daily_conversation(
     special_dates: list[dict],
     child_name: str = "",
 ) -> list[dict]:
-    """Plan today's conversation touchpoints for a parent."""
-    prompt = f"""You are planning today's conversation for an elderly parent care bot.
+    """Plan today's conversation touchpoints for a parent.
 
-Parent profile: {json.dumps(parent_profile)}
+    Uses the full parent profile including bio, tone, and all meal times
+    to generate a personalised, well-timed conversation plan.
+    """
+    # Extract key profile fields for the prompt so Gemini has explicit context
+    nickname       = parent_profile.get("nickname", "")
+    bio            = parent_profile.get("bio", "")
+    tone           = parent_profile.get("tone", "warm")
+    activities     = parent_profile.get("activities", [])
+    conditions     = parent_profile.get("conditions", [])
+    wake_time      = parent_profile.get("wake_time", "06:30")
+    breakfast_time = parent_profile.get("breakfast_time", "08:30")
+    lunch_time     = parent_profile.get("lunch_time", "13:00")
+    evening_time   = parent_profile.get("evening_time", "17:00")
+    dinner_time    = parent_profile.get("dinner_time", "20:00")
+    sleep_time     = parent_profile.get("sleep_time", "22:00")
+    alone          = parent_profile.get("alone_during_day", False)
+    has_medicines  = parent_profile.get("has_medicines", bool(medicine_groups))
+
+    tone_desc = {
+        "warm":     "affectionate and loving like a devoted child",
+        "cheerful": "upbeat, light, and fun — never heavy",
+        "calm":     "gentle, soothing, and reassuring",
+    }.get(tone, "warm and caring")
+
+    prompt = f"""You are planning today's WhatsApp conversation for an elderly parent care bot.
+The bot speaks AS the child — every message should feel like the child themselves checking in.
+
+═══ PARENT PROFILE ═══
+Nickname: {nickname}
+Bio: {bio if bio else "No bio provided — use warm generic phrasing"}
+Tone: {tone_desc}
+Activities: {', '.join(activities) if activities else 'general household activities'}
+Health conditions: {', '.join(conditions) if conditions else 'none known'}
+Alone during day: {alone}
+Daily schedule:
+  Wake: {wake_time} | Breakfast: {breakfast_time} | Lunch: {lunch_time}
+  Evening: {evening_time} | Dinner: {dinner_time} | Sleep: {sleep_time}
+
+═══ CONTEXT ═══
 Active health issues: {json.dumps(active_health_flows)}
 Yesterday's context: {json.dumps(yesterday_context or {})}
 Medicine groups: {json.dumps(medicine_groups)}
 Special dates today: {json.dumps(special_dates)}
 Child's name: {child_name}
+Queued questions from child: {json.dumps(parent_profile.get("queued_questions", []))}
 
+═══ INSTRUCTIONS ═══
 Generate today's touchpoints. Return ONLY valid JSON array.
 
-IMPORTANT — message_english must sound like a caring child texting their parent:
+MESSAGE RULES — every message_english must:
+- Sound like the child texting their parent (NOT a health app or bot)
 - Use ellipsis for natural pauses: "{{nickname}}... how are you today?"
-- Short and warm, under 20 words
-- Use {{nickname}} placeholder always
-- Casual phrasing: "Did you have your breakfast?" not "Have you eaten?"
-- Goodnight must mention child name warmly: "Rest well {{nickname}}... {child_name} misses you"
-- CRITICAL: Write in CLEAN ENGLISH only. No romanized regional words (no "Subhodayam",
-  "baagunnara", "tiffin ayyaka", etc.) — the system translates automatically.
+- Be short and warm, under 20 words
+- Always use {{nickname}} placeholder
+- Be casual: "Did you have your breakfast?" not "Have you eaten your morning meal?"
+- Reference {nickname}'s real life: their activities ({', '.join(activities[:3]) if activities else 'general'})
+  and conditions ({', '.join(conditions[:2]) if conditions else 'general health'}) where natural
+- Match the {tone} tone: {tone_desc}
+- Goodnight must warmly mention child name: "Rest well {{nickname}}... {child_name} misses you"
+- CRITICAL: Write in CLEAN ENGLISH only. No romanized regional words — the system translates automatically.
 
-Example touchpoints:
+SCHEDULING RULES:
+- Time touchpoints around the parent's actual schedule above
+- Before-food medicine comes BEFORE food_check (before {breakfast_time})
+- After-food medicine comes AFTER food_check (after {breakfast_time})
+- Activity check in the afternoon (around {lunch_time}–{evening_time})
+- Evening check-in around {evening_time}
+- Night medicine before {sleep_time}
+- Always end with "anything_else" touchpoint (include_voice_invite: true)
+- Always include "goodnight" as the LAST touchpoint
+- If health flow is active, morning_greeting should ask about THAT condition specifically
+- If special date today, morning_greeting should acknowledge it warmly
+- Maximum 6-7 touchpoints per day (don't overload the parent)
+
+VALID touchpoint_type values (ONLY these, no others):
+  morning_greeting, food_check, medicine_before_food, medicine_after_food,
+  medicine_night, activity_check, evening_checkin, anything_else, goodnight
+
+Example output:
 [
     {{
         "touchpoint_type": "morning_greeting",
-        "time_slot": "08:00",
+        "time_slot": "{breakfast_time}",
         "message_english": "Good morning {{nickname}}! Did you sleep well? How are you feeling today?",
         "button_options": [
             {{"emoji": "😊", "text_english": "Feeling good", "action": "mood_good"}},
@@ -275,20 +342,6 @@ Example touchpoints:
         "medicine_group_id": null
     }}
 ]
-
-Rules:
-- If health flow is active (e.g., fever), morning_greeting should ask about THAT condition
-- Medicine touchpoints only for groups that exist in the schedule
-- Before-food medicine comes BEFORE food_check
-- After-food medicine comes AFTER food_check
-- Always end with "anything_else" touchpoint (voice invite)
-- Always include "goodnight" as last touchpoint
-- Maximum 6-7 touchpoints per day
-- Goodnight message should mention the child's name: "{child_name}"
-- CRITICAL: touchpoint_type MUST be one of ONLY these exact values:
-  morning_greeting, food_check, medicine_before_food, medicine_after_food,
-  medicine_night, activity_check, evening_checkin, anything_else, goodnight
-- Never use any other touchpoint_type value like "medicine_check" or "pain_check"
 
 Respond ONLY with the JSON array."""
 
@@ -311,14 +364,14 @@ async def analyze_weekly_patterns(
 ) -> dict:
     """Analyze 7-14 days of data for patterns."""
     med_checkins = [c for c in checkins if c.get("touchpoint", "").startswith("medicine_")]
-    med_total = len(med_checkins)
-    med_taken = sum(
+    med_total    = len(med_checkins)
+    med_taken    = sum(
         1 for c in med_checkins
         if c.get("status") == "replied" and isinstance(c.get("medicine_taken"), dict)
         and c["medicine_taken"].get("taken")
     )
-    med_missed = sum(1 for c in med_checkins if c.get("status") == "missed")
-    med_adherence_pct = round(med_taken / med_total * 100) if med_total else None
+    med_missed         = sum(1 for c in med_checkins if c.get("status") == "missed")
+    med_adherence_pct  = round(med_taken / med_total * 100) if med_total else None
 
     prompt = f"""Analyze this elderly parent's health check-in data from the past week.
 

@@ -151,7 +151,7 @@ async def generate_daily_report(family_id: str) -> None:
         # One message per parent, per child
         for block, parent in zip(parent_blocks, parents):
             header = f"📊 *AYANA Daily Report — {date_label}*\n\n"
-            footer = _daily_footer(parent)
+            footer = _daily_footer(parent, family_id=family_id)
             message = header + block + "\n\n" + footer
             for child in children:
                 await _safe_send(child["phone"], message)
@@ -161,7 +161,7 @@ async def generate_daily_report(family_id: str) -> None:
         header    = f"📊 *AYANA Daily Report — {date_label}*\n\n"
         body      = f"\n\n{_DIVIDER}\n\n".join(parent_blocks)
         # Footer uses the first parent's checkin_time as a proxy
-        footer    = _daily_footer(parents[0]) if parents else ""
+        footer    = _daily_footer(parents[0], family_id=family_id) if parents else ""
         message   = header + body + "\n\n" + _DIVIDER + "\n" + footer
         for child in children:
             await _safe_send(child["phone"], message)
@@ -534,19 +534,28 @@ def _format_medicine_status(med_checkins: list[dict]) -> str:
     return "💊 Medicines: " + "  ".join(parts)
 
 
-def _daily_footer(parent: dict) -> str:
-    """Return the footer line for a daily report.
-
-    Shows the next check-in time for the first parent in the report.
+def _daily_footer(parent: dict, family_id: str | None = None) -> str:
+    """Return the footer for a daily report — check-in time + dashboard link.
 
     Args:
-        parent: Parent row with checkin_time.
+        parent:    Parent row with checkin_time.
+        family_id: UUID for generating the dashboard URL (optional).
 
     Returns:
         Formatted footer string.
     """
     ct = str(parent.get("checkin_time", "08:00"))[:5]
-    return f"_Next check-in: tomorrow at {ct}_"
+    footer = f"_Next check-in: tomorrow at {ct}_"
+
+    if family_id:
+        try:
+            from app.utils.token import make_report_url
+            url = make_report_url(family_id)
+            footer += f"\n📊 _View dashboard: {url}_"
+        except Exception:
+            pass  # Dashboard link is non-critical — never fail a report over it
+
+    return footer
 
 
 async def _safe_send(phone: str, message: str) -> None:
